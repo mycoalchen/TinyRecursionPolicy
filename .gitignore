@@ -3,3 +3,4 @@ outputs
 wandb
 __pycache__/
 out
+checkpoints
