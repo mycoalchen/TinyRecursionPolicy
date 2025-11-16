@@ -428,18 +428,22 @@ def evaluate(
     world_size: int,
     cpu_group: Optional[dist.ProcessGroup],
     subset_sampling_seed: int,
+    use_subset_of_data: bool = True,
 ):
     reduced_metrics = None
 
     # we might not want to do eval with the entire test dataset every time
-    data_subset_batch_indices = sample_dataset_batch_indices(
-        len(eval_loader),
-        rank,
-        world_size,
-        subset_sampling_seed,
-        config.eval_dataset_fraction,
-        config.eval_max_batches,
-    )
+    if use_subset_of_data:
+        data_subset_batch_indices = sample_dataset_batch_indices(
+            len(eval_loader),
+            rank,
+            world_size,
+            subset_sampling_seed,
+            config.eval_dataset_fraction,
+            config.eval_max_batches,
+        )
+    else:
+        data_subset_batch_indices = None
 
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
@@ -586,11 +590,57 @@ def evaluate(
                 print(f"  Completed {evaluator.__class__.__name__}")
 
         if rank == 0:
-            print(f"All evaluators completed! Elapsed time {
-                (datetime.datetime.now() - eval_start_time).seconds}s")
+            print(
+                f"All evaluators completed! Elapsed time {(datetime.datetime.now() - eval_start_time).seconds}s"
+            )
 
     return reduced_metrics
 
+
+def eval_log_and_checkpoint(
+    RANK: int,
+    WORLD_SIZE: int,
+    CPU_PROCESS_GROUP,
+    config: PretrainConfig,
+    train_state: TrainState,
+    ema_helper: EMAHelper,
+    eval_loader: torch.utils.data.DataLoader,
+    eval_metadata: PuzzleDatasetMetadata,
+    evaluators: List[Any],
+    checkpoint: bool,
+    use_subset_of_data: bool = False,
+):
+    if RANK == 0:
+        print("EVALUATE")
+    if config.ema:
+        print("SWITCH TO EMA")
+        train_state_eval = copy.deepcopy(train_state)
+        train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+    else:
+        train_state_eval = train_state
+    train_state_eval.model.eval()
+    metrics = evaluate(
+        config,
+        train_state_eval,
+        eval_loader,
+        eval_metadata,
+        evaluators,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+        cpu_group=CPU_PROCESS_GROUP,
+        subset_sampling_seed=torch.randint(low=0, high=100, size=(1,)).item(),
+        use_subset_of_data=use_subset_of_data,
+    )
+
+    if RANK == 0 and metrics is not None:
+        wandb.log(metrics, step=train_state.step)
+
+    if checkpoint and RANK == 0:
+        print("SAVE CHECKPOINT")
+        save_train_state(config, train_state_eval)
+
+    if config.ema:
+        del train_state_eval
 
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
@@ -725,7 +775,7 @@ def launch(hydra_config: DictConfig):
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump())  # type: ignore
         wandb.log(
             {"num_params": sum(x.numel() for x in train_state.model.parameters())},
             step=0,
@@ -764,40 +814,35 @@ def launch(hydra_config: DictConfig):
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
-            if RANK == 0:
-                print("EVALUATE")
-            if config.ema:
-                print("SWITCH TO EMA")
-                train_state_eval = copy.deepcopy(train_state)
-                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
-            else:
-                train_state_eval = train_state
-            train_state_eval.model.eval()
-            metrics = evaluate(
+            eval_log_and_checkpoint(
+                RANK,
+                WORLD_SIZE,
+                CPU_PROCESS_GROUP,
                 config,
-                train_state_eval,
+                train_state,
+                ema_helper,
                 eval_loader,
                 eval_metadata,
                 evaluators,
-                rank=RANK,
-                world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP,
-                subset_sampling_seed=torch.randint(low=0, high=100, size=(1,)).item()
+                config.checkpoint_every_eval or (_iter_id == total_iters - 1),
+                True,
             )
 
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-
-            ############ Checkpointing
-            if RANK == 0:
-                print("SAVE CHECKPOINT")
-            if RANK == 0 and (
-                config.checkpoint_every_eval or (_iter_id == total_iters - 1)
-            ):
-                save_train_state(config, train_state_eval)
-
-            if config.ema:
-                del train_state_eval
+    # final evaluation with full test dataset
+    print("FINAL EVALUATION WITH FULL TEST DATASET")
+    eval_log_and_checkpoint(
+        RANK,
+        WORLD_SIZE,
+        CPU_PROCESS_GROUP,
+        config,
+        train_state,
+        ema_helper,
+        eval_loader,
+        eval_metadata,
+        evaluators,
+        True,
+        False,
+    )
 
     # finalize
     if dist.is_initialized():

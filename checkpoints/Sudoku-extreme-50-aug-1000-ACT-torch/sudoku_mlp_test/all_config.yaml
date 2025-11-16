@@ -20,16 +20,16 @@ arch:
   puzzle_emb_ndim: 512
 beta1: 0.9
 beta2: 0.95
-checkpoint_every_eval: false
+checkpoint_every_eval: true
 checkpoint_path: checkpoints/Sudoku-extreme-50-aug-1000-ACT-torch/sudoku_mlp_test
 data_paths:
 - data/sudoku-extreme-50-aug-1000
 data_paths_test: []
 ema: true
 ema_rate: 0.999
-epochs: 5000
+epochs: 50000
 eval_dataset_fraction: 0.1
-eval_interval: 500
+eval_interval: 5000
 eval_max_batches: 25
 eval_save_outputs: []
 evaluators: []
@@ -38,7 +38,7 @@ global_batch_size: 768
 load_checkpoint: null
 lr: 0.0001
 lr_min_ratio: 1.0
-lr_warmup_steps: 200
+lr_warmup_steps: 2000
 min_eval_interval: 0
 project_name: Sudoku-extreme-50-aug-1000-ACT-torch
 puzzle_emb_lr: 0.0001

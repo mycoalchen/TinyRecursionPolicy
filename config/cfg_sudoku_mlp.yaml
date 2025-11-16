@@ -17,17 +17,17 @@ evaluators: []
 # Hyperparams - Training
 global_batch_size: 768
 
-epochs: 5000 # 50000
+epochs: 50000 # 50000
 # eval is every eval_interval * (train dataset size) / global_batch_size batches
-eval_interval: 500 # 5000
-checkpoint_every_eval: False # True
+eval_interval: 5000 # 5000
+checkpoint_every_eval: True # True
 
 eval_dataset_fraction: 0.1
 eval_max_batches: 25
 
 lr: 1e-4
 lr_min_ratio: 1.0
-lr_warmup_steps: 200 # 2000
+lr_warmup_steps: 2000 # 2000
 
 # Standard hyperparameter settings for LM, as used in Llama
 beta1: 0.9

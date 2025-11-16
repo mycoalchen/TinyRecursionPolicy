@@ -41,6 +41,7 @@ def _sample_batch(
         append_size = min(puzzle_size, global_batch_size - current_size)
 
         # Put into batch
+        # NOTE: should this be rng.choice for reproducible multi-GPU training?
         batch_puzzle_indices.append(np.full(append_size, puzzle_id, dtype=np.int32))
         batch.append(
             puzzle_start + np.random.choice(puzzle_size, append_size, replace=False)
@@ -148,7 +149,7 @@ class PuzzleDataset(IterableDataset):
         if self.split == 'test':
             return self.num_batches
         else:
-            raise "Called __len__ on non-test dataloader. __len__ is currently only calculated for test dataloaders."
+            raise RuntimeError("Called __len__ on non-test dataloader. __len__ is currently only calculated for test dataloaders.")
 
     def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
         with open(os.path.join(dataset_path, self.split, "dataset.json"), "r") as f:
