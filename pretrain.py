@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
 
+import datetime
 import tqdm
 import wandb
 import coolname
@@ -555,6 +556,7 @@ def evaluate(
 
         # Run evaluators
         if rank == 0:
+            eval_start_time = datetime.datetime.now()
             print(f"\nRunning {len(evaluators)} evaluator(s)...")
 
         for i, evaluator in enumerate(evaluators):
@@ -584,7 +586,8 @@ def evaluate(
                 print(f"  Completed {evaluator.__class__.__name__}")
 
         if rank == 0:
-            print("All evaluators completed!")
+            print(f"All evaluators completed! Elapsed time {
+                (datetime.datetime.now() - eval_start_time).seconds}s")
 
     return reduced_metrics
 
