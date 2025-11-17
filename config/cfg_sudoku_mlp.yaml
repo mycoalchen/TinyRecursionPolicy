@@ -9,7 +9,7 @@ hydra:
   output_subdir: null
 
 # Data path
-data_paths: ['data/sudoku-extreme-50-aug-1000']
+data_paths: ['data/sudoku-extreme-1k-aug-1000']
 data_paths_test: []
 
 evaluators: []

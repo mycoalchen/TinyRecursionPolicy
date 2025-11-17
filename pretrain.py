@@ -432,6 +432,9 @@ def evaluate(
 ):
     reduced_metrics = None
 
+    if rank == 0:
+        eval_start_time = datetime.datetime.now()
+
     # we might not want to do eval with the entire test dataset every time
     if use_subset_of_data:
         data_subset_batch_indices = sample_dataset_batch_indices(
@@ -560,7 +563,6 @@ def evaluate(
 
         # Run evaluators
         if rank == 0:
-            eval_start_time = datetime.datetime.now()
             print(f"\nRunning {len(evaluators)} evaluator(s)...")
 
         for i, evaluator in enumerate(evaluators):
