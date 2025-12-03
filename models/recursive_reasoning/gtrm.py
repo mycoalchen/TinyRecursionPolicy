@@ -1,29 +1,25 @@
-from typing import Tuple, List, Dict, Optional
+from typing import Iterable, Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
 import torch
-import copy
 import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
-import random
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
+from einops import rearrange
 
 IGNORE_LABEL_ID = -100
 
-# State passed between inner loops
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1InnerCarry:
+class GaussianTRM_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
 
-
-# State passed betewen outer loops
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1Carry:
-    inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
+class GaussianTRM_ACTV1Carry:
+    inner_carry: GaussianTRM_ACTV1InnerCarry
     
     steps: torch.Tensor
     halted: torch.Tensor
@@ -31,7 +27,7 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
     current_data: Dict[str, torch.Tensor]
 
 
-class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
+class GaussianTRM_ACTV1Config(BaseModel):
     batch_size: int
     seq_len: int
     puzzle_emb_ndim: int = 0
@@ -63,9 +59,10 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    log_sigma_head_init_bias: float = -5.0 # Initial bias for log_sigma head (negative = small sigma initially)
 
-class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
-    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+class GaussianTRM_ACTV1Block(nn.Module):
+    def __init__(self, config: GaussianTRM_ACTV1Config) -> None:
         super().__init__()
 
         self.config = config
@@ -90,13 +87,12 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # B, L, D = hidden_states.shape
         # Post Norm
         if self.config.mlp_t:
-            hidden_states = hidden_states.transpose(1,2)
+            hidden_states = rearrange(hidden_states, "B L D -> B D L")
             out = self.mlp_t(hidden_states)
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-            hidden_states = hidden_states.transpose(1,2)
+            hidden_states = rearrange(hidden_states, "B D L -> B L D")
         else:
             # Self Attention
             hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
@@ -105,22 +101,37 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
 
-# Wrapper for multiple Blocks; represented by f in the paper
-class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
-    def __init__(self, layers: List[TinyRecursiveReasoningModel_ACTV1Block]):
+class GaussianTRM_ACTV1ReasoningModule(nn.Module):
+    def __init__(self, config: GaussianTRM_ACTV1Config, layers: List[GaussianTRM_ACTV1Block]):
         super().__init__()
+        self.config = config
         self.layers = torch.nn.ModuleList(layers)
+        self.mu_head = CastedLinear(
+            self.config.hidden_size,
+            self.config.hidden_size,
+            bias=True,
+        )
+        # sigma in log-space to guarantee positive sigma
+        self.log_sigma_head = CastedLinear(
+            self.config.hidden_size,
+            self.config.hidden_size,
+            bias=True,
+        )
+        # might help early stability to start with small sigma
+        with torch.no_grad():
+            self.log_sigma_head.bias.fill_(self.config.log_sigma_head_init_bias)
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
         hidden_states = hidden_states + input_injection
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
-        return hidden_states
+        mu = self.mu_head(hidden_states)
+        log_sigma = self.log_sigma_head(hidden_states)
+        return mu + torch.exp(log_sigma) * torch.randn_like(log_sigma)
 
 
-# Stacks multiple ReasoningModules, each with multiple Blocks, and wraps with I/O layers
-class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
-    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+class GaussianTRM_ACTV1_Inner(nn.Module):
+    def __init__(self, config: GaussianTRM_ACTV1Config) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
@@ -151,7 +162,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             pass
 
         # Reasoning Layers
-        self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        self.L_level = GaussianTRM_ACTV1ReasoningModule(config=self.config, layers=[GaussianTRM_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -186,18 +197,18 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+        return GaussianTRM_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
-    def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+    def reset_carry(self, reset_flag: torch.Tensor, carry: GaussianTRM_ACTV1InnerCarry):
+        return GaussianTRM_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: GaussianTRM_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[GaussianTRM_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -220,20 +231,19 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = GaussianTRM_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
-# Wraps Inner
-class TinyRecursiveReasoningModel_ACTV1(nn.Module):
+class GaussianTRM_ACTV1(nn.Module):
     """ACT wrapper."""
 
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
-        self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(self.config)
+        self.config = GaussianTRM_ACTV1Config(**config_dict)
+        self.inner = GaussianTRM_ACTV1_Inner(self.config)
 
     @property
     def puzzle_emb(self):
@@ -242,7 +252,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(
+        return GaussianTRM_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
@@ -251,7 +261,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: GaussianTRM_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[GaussianTRM_ACTV1Carry, Dict[str, torch.Tensor]]:
 
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
@@ -299,4 +309,4 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return GaussianTRM_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

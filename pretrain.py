@@ -212,6 +212,9 @@ def create_model(
 
 
 def mix_weights_direct(device, alpha, net, nets):
+    """
+    Get weighted combination of the models in nets. Weights given by alpha. Returns net with merged weights.
+    """
     sd = []
     for i in range(len(nets)):
         sd += [nets[i].state_dict()]

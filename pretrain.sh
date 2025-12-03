@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=trm
+#SBATCH --job-name=gtrm
 #SBATCH --output=out/%x-%j.log            # Stdout log file (%x=job name, %j=job ID)
 #SBATCH --error=out/%x-%j.err
 #SBATCH --partition=general
@@ -10,4 +10,4 @@
 set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate trp
-python pretrain.py --config-name=cfg_sudoku_mlp
+python pretrain.py --config-name=cfg_sudoku_mlp_gtrm
