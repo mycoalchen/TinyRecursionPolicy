@@ -14,7 +14,8 @@ IGNORE_LABEL_ID = -100
 
 @dataclass
 class GaussianTRM_ACTV1InnerCarry:
-    z_H: torch.Tensor
+    # z_H is Optional to support num_latents=1 mode
+    z_H: Optional[torch.Tensor]
     z_L: torch.Tensor
 
 @dataclass
@@ -61,6 +62,14 @@ class GaussianTRM_ACTV1Config(BaseModel):
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
     log_sigma_head_init_bias: float = -5.0 # Initial bias for log_sigma head (negative = small sigma initially)
 
+    # --- NEW CONFIG SWITCHES ---
+    num_latents: int = 2 # 1 = Flat Recurrence, 2 = Hierarchical (Manager/Worker)
+    
+    # Options: "latent", "add", "concat"
+    # Controls input to the Gaussian heads (mu/sigma)
+    stochastic_head_input: str = "latent" 
+
+
 class GaussianTRM_ACTV1Block(nn.Module):
     def __init__(self, config: GaussianTRM_ACTV1Config) -> None:
         super().__init__()
@@ -106,14 +115,20 @@ class GaussianTRM_ACTV1ReasoningModule(nn.Module):
         super().__init__()
         self.config = config
         self.layers = torch.nn.ModuleList(layers)
+        
+        # Calculate input dimension for Gaussian heads based on config
+        self.head_input_dim = self.config.hidden_size
+        if self.config.stochastic_head_input == "concat":
+            self.head_input_dim = self.config.hidden_size * 2
+            
         self.mu_head = CastedLinear(
-            self.config.hidden_size,
+            self.head_input_dim,
             self.config.hidden_size,
             bias=True,
         )
         # sigma in log-space to guarantee positive sigma
         self.log_sigma_head = CastedLinear(
-            self.config.hidden_size,
+            self.head_input_dim,
             self.config.hidden_size,
             bias=True,
         )
@@ -122,11 +137,27 @@ class GaussianTRM_ACTV1ReasoningModule(nn.Module):
             self.log_sigma_head.bias.fill_(self.config.log_sigma_head_init_bias)
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+        # Injection logic for the recurrence path (always add)
         hidden_states = hidden_states + input_injection
+        
+        # Run Transformer/MLP Layers
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
-        mu = self.mu_head(hidden_states)
-        log_sigma = self.log_sigma_head(hidden_states)
+            
+        # Prepare inputs for Mu/Sigma heads based on config
+        if self.config.stochastic_head_input == "latent":
+            head_input = hidden_states
+        elif self.config.stochastic_head_input == "add":
+            head_input = hidden_states + input_injection
+        elif self.config.stochastic_head_input == "concat":
+            head_input = torch.cat([hidden_states, input_injection], dim=-1)
+        else:
+            raise ValueError(f"Unknown stochastic_head_input: {self.config.stochastic_head_input}")
+
+        mu = self.mu_head(head_input)
+        log_sigma = self.log_sigma_head(head_input)
+        
+        # Re-parameterization trick
         return mu + torch.exp(log_sigma) * torch.randn_like(log_sigma)
 
 
@@ -165,8 +196,17 @@ class GaussianTRM_ACTV1_Inner(nn.Module):
         self.L_level = GaussianTRM_ACTV1ReasoningModule(config=self.config, layers=[GaussianTRM_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
         # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        
+        # Always init L (Worker / Main State)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        
+        # Conditionally init H (Manager State)
+        if self.config.num_latents == 2:
+            self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        else:
+            # Placeholder to satisfy load_state_dict if architectures switch, 
+            # though usually strictly separated by config.
+            self.register_buffer("H_init", None)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -197,14 +237,22 @@ class GaussianTRM_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        z_H = None
+        if self.config.num_latents == 2:
+            z_H = torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype)
+            
         return GaussianTRM_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=z_H,
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: GaussianTRM_ACTV1InnerCarry):
+        z_H = None
+        if self.config.num_latents == 2:
+            z_H = torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H)
+            
         return GaussianTRM_ACTV1InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_H=z_H,
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
@@ -217,23 +265,50 @@ class GaussianTRM_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
-        # 1 with grad
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+        
+        # --- BRANCHING LOGIC FOR 1 VS 2 LATENTS ---
+        
+        if self.config.num_latents == 2:
+            # === HIERARCHICAL RECURRENCE (Original) ===
+            # H_cycles-1 without grad
+            with torch.no_grad():
+                for _H_step in range(self.config.H_cycles-1):
+                    for _L_step in range(self.config.L_cycles):
+                        # L gets injected with Manager(H) + Input
+                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                    # H gets injected with Worker(L)
+                    z_H = self.L_level(z_H, z_L, **seq_info)
+            # 1 with grad
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+            z_H = self.L_level(z_H, z_L, **seq_info)
+            
+            readout_state = z_H
+
+        else:
+            # === FLAT RECURRENCE ===
+            # We treat z_L as the single state 'z'. 
+            # z_H is unused/None.
+            total_steps = self.config.H_cycles * self.config.L_cycles
+            
+            with torch.no_grad():
+                for _ in range(total_steps - 1):
+                    # z_L gets injected with Input only
+                    z_L = self.L_level(z_L, input_embeddings, **seq_info)
+            
+            # Final step with grad
+            z_L = self.L_level(z_L, input_embeddings, **seq_info)
+            
+            readout_state = z_L
+            z_H = None # ensure it stays None
 
         # LM Outputs
-        new_carry = GaussianTRM_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        new_carry = GaussianTRM_ACTV1InnerCarry(z_H=z_H.detach() if z_H is not None else None, z_L=z_L.detach())  # New carry no grad
+        
+        output = self.lm_head(readout_state)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head(readout_state[:, 0]).to(torch.float32) # Q-head
+        
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
