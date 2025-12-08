@@ -20,7 +20,7 @@ global_batch_size: 768
 epochs: 50000 # 50000
 # eval is every eval_interval * (train dataset size) / global_batch_size batches
 eval_interval: 5000 # 5000
-checkpoint_every_eval: False # True
+checkpoint_every_eval: True # True
 
 eval_dataset_fraction: 0.1
 eval_max_batches: 25
@@ -47,7 +47,7 @@ freeze_weights: False # If True, freeze weights and only learn the embeddings
 
 # Run name
 project_name: 'Tiny Recursion Policy'
-run_name: F_fpe_F_y
+run_name: trm_y_TE
 
 # Architecture overrides
 arch:

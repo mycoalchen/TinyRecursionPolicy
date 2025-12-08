@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=gtrm
-#SBATCH --output=out/%A/gtrmarr_%A_%a.out
-#SBATCH --error=out/%A/gtrmarr_%A_%a.err
-#SBATCH --array=0-5
+#SBATCH --job-name=trm
+#SBATCH --output=out/%A/trmarr_%A_%a.out
+#SBATCH --error=out/%A/trmarr_%A_%a.err
+#SBATCH --array=0-1
 #SBATCH --time=36:00:00
 #SBATCH --partition=general
 #SBATCH --gres=gpu:1
@@ -21,11 +21,9 @@ else
 fi
 
 # Define bash arrays for the parameters
-H_deterministic_mode_list=("False" "False" "separate weights" "separate weights" "skip noise" "skip noise")
-time_embed_list=(True False True False True False)
+time_embed_list=(True False)
 
 # Get values for this task
-H_deterministic_mode_val=${H_deterministic_mode_list[$SLURM_ARRAY_TASK_ID]}
 time_embed_val=${time_embed_list[$SLURM_ARRAY_TASK_ID]}
 
 # Get checkpoint for this task (if available)
@@ -37,21 +35,6 @@ else
     checkpoint_val=""
 fi
 
-# Generate abbreviated run_name from parameters
-# q_head_input_detached: True -> T, False -> F
-# q_head_input_form: "intermediate output" -> io, "first puzzle emb" -> fpe  
-# H_deterministic_mode: "separate weights" -> sw, "False" -> F
-
-if [ "$H_deterministic_mode_val" = "separate weights" ]; then
-    mode_abbrev="sw"
-elif [ "$H_deterministic_mode_val" = "False" ]; then
-    mode_abbrev="F"
-elif [ "$H_deterministic_mode_val" = "skip noise" ]; then
-    mode_abbrev="sn"
-else
-    mode_abbrev="unknown"
-fi
-
 if [ "$time_embed_val" = "True" ]; then
     time_embed_abbrev="TE"
 elif [ "$time_embed_val" = "False" ]; then
@@ -60,12 +43,12 @@ else
     time_embed_abbrev="unknown"
 fi
 
-run_name="${mode_abbrev}_${time_embed_abbrev}"
+run_name="${time_embed_abbrev}"
 
 if [ -n "$checkpoint_val" ]; then
-    echo "Running task $SLURM_ARRAY_TASK_ID: H_deterministic_mode=$H_deterministic_mode_val, time_embed=$time_embed_val, run_name=$run_name, checkpoint=$checkpoint_val"
+    echo "Running task $SLURM_ARRAY_TASK_ID: time_embed=$time_embed_val, run_name=$run_name, checkpoint=$checkpoint_val"
 else
-    echo "Running task $SLURM_ARRAY_TASK_ID: H_deterministic_mode=$H_deterministic_mode_val, time_embed=$time_embed_val, run_name=$run_name"
+    echo "Running task $SLURM_ARRAY_TASK_ID: time_embed=$time_embed_val, run_name=$run_name"
 fi
 
 eval "$(conda shell.bash hook)"
@@ -74,8 +57,7 @@ conda activate trp
 # Run pretrain.py with config overrides
 # Use single quotes around value to force string interpretation in Hydra/YAML
 python_cmd="python pretrain.py \
-  --config-name=cfg_sudoku_mlp_gtrm \
-  \"arch.H_deterministic_mode='$H_deterministic_mode_val'\" \
+  --config-name=cfg_sudoku_mlp \
   arch.time_embeddings=$time_embed_val \
   run_name=\"$run_name\""
 

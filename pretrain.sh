@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=trm
+#SBATCH --job-name=trm-time_emb
 #SBATCH --output=out/%x-y-%j.log            # Stdout log file (%x=job name, %j=job ID)
 #SBATCH --error=out/%x-y-%j.err
 #SBATCH --partition=general

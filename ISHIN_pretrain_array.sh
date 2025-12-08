@@ -12,11 +12,11 @@
 set -euo pipefail
 
 # Define bash arrays for the parameters
-q_head_input_detached_list=(False False True False False False False False)
-q_head_input_form_list=("first puzzle emb" "first puzzle emb" "intermediate output" "intermediate output" "first puzzle emb" "first puzzle emb" "first puzzle emb" "first puzzle emb")
-H_deterministic_mode_list=("skip noise" "skip noise" "skip noise" "skip noise" "skip noise" "skip noise" "skip noise" "skip noise")
-time_embed_list=(False True True True False True False True)
-actlw_list=(1.5 1.5 1 1 1.25 1.25 1 1)
+q_head_input_detached_list=(False False False False False False True True)
+q_head_input_form_list=("first puzzle emb" "first puzzle emb" "first puzzle emb" "first puzzle emb" "first puzzle emb" "first puzzle emb" "intermediate output" "intermediate output")
+H_deterministic_mode_list=("False" "False" "skip noise" "skip noise" "separate weights" "separate weights" "skip noise" "skip noise")
+time_embed_list=(True False True False True False True False)
+actlw_list=(1.25 1.25 1.25 1.25 1.25 1.25 1 1)
 
 # Get values for this task
 q_head_input_detached_val=${q_head_input_detached_list[$SLURM_ARRAY_TASK_ID]}
@@ -30,9 +30,9 @@ actlw_val=${actlw_list[$SLURM_ARRAY_TASK_ID]}
 # q_head_input_form: "intermediate output" -> io, "first puzzle emb" -> fpe  
 # H_deterministic_mode: "separate weights" -> sw, "False" -> F, "skip noise" -> sn
 if [ "$q_head_input_detached_val" = "True" ]; then
-    detached_abbrev="T"
+    detached_abbrev="sg"
 else
-    detached_abbrev="F"
+    detached_abbrev="nsg"
 fi
 
 if [ "$q_head_input_form_val" = "intermediate output" ]; then
@@ -54,9 +54,9 @@ else
 fi
 
 if [ "$time_embed_val" = "True" ]; then
-    time_embed_abbrev="T"
+    time_embed_abbrev="TE"
 elif [ "$time_embed_val" = "False" ]; then
-    time_embed_abbrev="F"
+    time_embed_abbrev="NTE"
 else
     time_embed_abbrev="unknown"
 fi
@@ -73,7 +73,7 @@ conda activate trp
 python pretrain.py \
   --config-name=cfg_sudoku_mlp_gtrm \
   arch.q_head_input_detached=$q_head_input_detached_val \
-  arch.q_head_input_form="$q_head_input_form_val" \
+  "arch.q_head_input_form='$q_head_input_form_val'" \
   "arch.H_deterministic_mode='$H_deterministic_mode_val'" \
   arch.time_embeddings=$time_embed_val \
   arch.loss.act_loss_weight=$actlw_val \
