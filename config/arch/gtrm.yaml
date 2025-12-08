@@ -1,7 +1,8 @@
-name: recursive_reasoning.gtrm@GaussianTRM_ACTV1
+name: recursive_reasoning.gtrm@GTRM
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
+  act_loss_weight: 1
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
@@ -26,3 +27,11 @@ puzzle_emb_len: 16 # if non-zero, its specified to this value
 no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
 log_sigma_head_init_bias: -5 # start with low exploration for early stability
+
+q_head_input_detached: True
+q_head_input_form: "intermediate output" # "intermediate output" for un-embedded z_H or "first puzzle emb" for z_H[:, 0, :] (original)
+
+H_deterministic_mode: "skip noise" # "separate weights" or "skip noise" or "False"
+
+force_max_steps_at_eval: False
+time_embeddings: True

@@ -132,24 +132,19 @@ class PuzzleDataset(IterableDataset):
         self._iters = 0
 
         # Length
-        if self.split == 'test':
-            print("Calculating size of test set...")
-            self.num_batches = 0
-            for set_name in self.metadata.sets:
-                for i, dataset_path in tqdm(enumerate(self.config.dataset_paths)):
-                    inputs = np.load(
-                        os.path.join(dataset_path, self.split, f"{set_name}__inputs.npy"),
-                        mmap_mode="r",
-                    )
-                    self.num_batches += (
-                        len(inputs) + self.config.global_batch_size - 1
-                    ) // self.config.global_batch_size
+        self.num_batches = 0
+        for set_name in self.metadata.sets:
+            for i, dataset_path in tqdm(enumerate(self.config.dataset_paths)):
+                inputs = np.load(
+                    os.path.join(dataset_path, self.split, f"{set_name}__inputs.npy"),
+                    mmap_mode="r",
+                )
+                self.num_batches += (
+                    len(inputs) + self.config.global_batch_size - 1
+                ) // self.config.global_batch_size
 
     def __len__(self):
-        if self.split == 'test':
-            return self.num_batches
-        else:
-            raise RuntimeError("Called __len__ on non-test dataloader. __len__ is currently only calculated for test dataloaders.")
+        return self.num_batches
 
     def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
         with open(os.path.join(dataset_path, self.split, "dataset.json"), "r") as f:

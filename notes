@@ -1,0 +1,39 @@
+Original
+    Training
+        Init: steps = 0, halted = 1
+        For halted puzzles:
+            steps = 0
+            reset z_L, z_H
+            replace data
+        Run model => new (z_L, z_H, logits, q_halt_logits) => outputs
+        steps += 1
+        halted = (steps >= 16) or (q_halt_logits > 0) or (exploration)
+        return new (z_L, z_H, steps, halted, data, outputs)
+    Evaluation
+        Init: steps = 0, halted = 1
+        For halted puzzles:
+            steps = 0
+            reset z_L, z_H
+            replace data
+        Run model => new (z_L, z_H, logits, q_halt_logits) => outputs
+        steps += 1
+        halted = (steps >= 16)
+        return new (z_L, z_H, steps, halted, data, outputs)
+
+New
+    Training
+        Init: steps = 0, halted = 1
+        For halted puzzle:
+            steps = 0
+            reset z_L, z_H
+            replace data
+        Run model => new (z_L, z_H, logits, q_halt_logits) => outputs
+        steps += 1
+        halted = (steps >= 16) or (q_halt_logits > 0) or (exploration)
+        return new (z_L, z_H, steps, halted, data, outputs)
+    Evaluation
+        Init: steps = 0, halted = 1
+        Run model => new (z_L, z_H, logits, q_halt_logits) => outputs (wrong)
+        steps += 1 where not halted
+        halted = (steps >= 16) or (q_halt_logits > 0)
+        

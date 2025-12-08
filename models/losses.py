@@ -39,13 +39,17 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module, loss_type: str, act_loss_weight: float):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.act_loss_weight = act_loss_weight
         
-    def initial_carry(self, *args, **kwargs):
-        return self.model.initial_carry(*args, **kwargs)  # type: ignore
+    def initial_state(self, *args, **kwargs):
+        if self.model.training:
+            return self.model.initial_state_train(*args, **kwargs)  # type: ignore
+        else:
+            return self.model.initial_state_eval(*args, **kwargs)  # type: ignore
 
     def forward(
         self,
@@ -55,23 +59,24 @@ class ACTLossHead(nn.Module):
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         # Model logits
         # B x SeqLen x D
-        new_carry, outputs = self.model(**model_kwargs)
-        labels = new_carry.current_data["labels"]
+        new_state, outputs = self.model(**model_kwargs)
+        labels = new_state.current_data["labels"]
 
         with torch.no_grad():
             # Preds
             outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
 
             # Correctness
-            mask = (labels != IGNORE_LABEL_ID)
-            loss_counts = mask.sum(-1)
-            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
+            mask = (labels != IGNORE_LABEL_ID) # (B, 81)
+            not_masked = mask.sum(-1) # (B) - all equal to 81
+            # Avoid NaNs in division
+            loss_divisor = not_masked.clamp_min(1).unsqueeze(-1) # (B, 1)
 
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
+            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels) #(B, 81)
+            seq_is_correct = is_correct.sum(-1) == not_masked
             
             # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
+            valid_metrics = new_state.halted & (not_masked > 0)
             metrics = {
                 "count": valid_metrics.sum(),
                 
@@ -79,7 +84,7 @@ class ACTLossHead(nn.Module):
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "steps":          torch.where(valid_metrics, new_state.steps, 0).sum(),
             }
 
         # Losses
@@ -97,7 +102,10 @@ class ACTLossHead(nn.Module):
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
         # Filter outputs for return
-        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+        if self.model.training:
+            detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+        else:
+            detached_outputs = {k: outputs[k].detach() for k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        return new_state, lm_loss + self.act_loss_weight * 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_state.halted.all()
 
