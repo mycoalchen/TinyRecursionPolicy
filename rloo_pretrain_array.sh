@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=gtrm
-#SBATCH --output=out/%A/gtrmarr_%A_%a.out
-#SBATCH --error=out/%A/gtrmarr_%A_%a.err
-#SBATCH --array=1
+#SBATCH --job-name=rloo
+#SBATCH --output=out/%A/rlooarr_%A_%a.out
+#SBATCH --error=out/%A/rlooarr_%A_%a.err
+#SBATCH --array=5
 #SBATCH --time=36:00:00
 #SBATCH --partition=general
 #SBATCH --gres=gpu:1
@@ -21,10 +21,15 @@ else
 fi
 
 # Define bash arrays for the parameters
-actlw_list=(1.25 1.5)
+B_list=(64 64 64 64 32 32 32 32)
+G_list=(16 16 16 16 32 32 32 32)
+E_list=(1 2.5 5 10 1 2.5 5 10)
+# H_list=("False" "False" "False" "False" "False" "False" "False" "False")
 
 # Get values for this task
-actlw_val=${actlw_list[$SLURM_ARRAY_TASK_ID]}
+B=${B_list[$SLURM_ARRAY_TASK_ID]}
+G=${G_list[$SLURM_ARRAY_TASK_ID]}
+E=${E_list[$SLURM_ARRAY_TASK_ID]}
 
 # Get checkpoint for this task (if available)
 task_idx=$((SLURM_ARRAY_TASK_ID))
@@ -39,11 +44,11 @@ fi
 # q_head_input_form: "intermediate output" -> io, "first puzzle emb" -> fpe  
 # H_deterministic_mode: "separate weights" -> sw, "False" -> F
 
-# if [ "$H_deterministic_mode_val" = "separate weights" ]; then
+# if [ "$H" = "separate weights" ]; then
 #     mode_abbrev="sw"
-# elif [ "$H_deterministic_mode_val" = "False" ]; then
+# elif [ "$H" = "False" ]; then
 #     mode_abbrev="F"
-# elif [ "$H_deterministic_mode_val" = "skip noise" ]; then
+# elif [ "$H" = "skip noise" ]; then
 #     mode_abbrev="sn"
 # else
 #     mode_abbrev="unknown"
@@ -57,7 +62,7 @@ fi
 #     time_embed_abbrev="unknown"
 # fi
 
-run_name="F_fpe_sw_NTE_${actlw_val}_small"
+run_name="rloo_B$B/G$G/E$E"
 
 if [ -n "$checkpoint_val" ]; then
     echo "Running task $SLURM_ARRAY_TASK_ID: run_name=$run_name, checkpoint=$checkpoint_val"
@@ -68,11 +73,11 @@ fi
 eval "$(conda shell.bash hook)"
 conda activate trp
 
-# Run pretrain.py with config overrides
-# Use single quotes around value to force string interpretation in Hydra/YAML
-python_cmd="python pretrain.py \
-  --config-name=cfg_sudoku_mlp_gtrm \
-  arch.loss.act_loss_weight=$actlw_val \
+python_cmd="python train_rloo.py \
+  --config-name=cfg_rloo \
+  global_batch_size=$B \
+  num_rollouts_per_input=$G \
+  rloo.entropy_coef=$E \
   run_name=\"$run_name\""
 
 # Add checkpoint if specified

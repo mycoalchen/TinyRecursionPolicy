@@ -1,0 +1,3685 @@
+Below is the codebase context. Each file is separated by a header and code block.
+
+File: config/arch/gtrm.yaml
+==================================================
+```yaml
+name: recursive_reasoning.gtrm@GTRM
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+  act_loss_weight: 1.5
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 256 # 512
+num_heads: 8  # min(2, hidden_size // 64)
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: none
+forward_dtype: bfloat16
+
+mlp_t: True # use mlp on L instead of transformer
+puzzle_emb_len: 16 # if non-zero, its specified to this value
+no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+log_sigma_head_init_bias: -5 # start with low exploration for early stability
+
+q_head_input_detached: False
+q_head_input_form: "first puzzle emb" # "intermediate output" for un-embedded z_H or "first puzzle emb" for z_H[:, 0, :] (original)
+
+H_deterministic_mode: "False" # "separate weights" or "skip noise" or "False"
+
+force_max_steps_at_eval: False
+time_embeddings: False
+```
+
+File: config/arch/trm.yaml
+==================================================
+```yaml
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+  act_loss_weight: 1
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 256 # 512
+num_heads: 8  # min(2, hidden_size // 64)
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+mlp_t: False # use mlp on L instead of transformer
+puzzle_emb_len: 16 # if non-zero, its specified to this value
+no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+force_max_steps_at_eval: False
+time_embeddings: True
+```
+
+File: config/cfg_rloo.yaml
+==================================================
+```yaml
+defaults:
+  - arch: gtrm
+  - _self_
+
+hydra:
+  output_subdir: null
+
+data_paths: ['data/sudoku-extreme-1k-aug-1000']
+data_paths_test: []
+
+global_batch_size: 256
+num_rollouts_per_input: 4
+training_steps: 2000
+
+eval_batch_size: 1536
+eval_interval: 200
+eval_max_batches: 20 # 25
+eval_dataset_fraction: 0.05
+checkpoint_every_eval: True
+
+lr: 1e-5
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+
+beta1: 0.9
+beta2: 0.95
+weight_decay: 1.0
+puzzle_emb_weight_decay: 1.0
+
+puzzle_emb_lr: 1e-4
+
+seed: 0
+
+use_kl: False # False
+
+project_name: 'rloo'
+run_name: rloo
+
+# load_checkpoint: 'checkpoints/Tiny Recursion Policy/sw_NTE_cont/step_32540'
+# checkpoint_path: 'checkpoints/Tiny Recursion Policy/RL_sw_NTE'
+
+rloo:
+  epsilon: 0.2
+  reward_type: cell_match  # "validation" or "cell_match"
+  entropy_coef: 0.01
+
+forward_dtype: float32
+```
+
+File: config/cfg_pretrain.yaml
+==================================================
+```yaml
+# ARC training config
+
+defaults:
+  - arch: trm
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Data path
+data_paths: ['data/arc-aug-1000']
+data_paths_test: []
+
+evaluators:
+  - name: arc@ARC
+
+# Hyperparams - Training
+global_batch_size: 768
+
+epochs: 100000
+eval_interval: 10000
+checkpoint_every_eval: True
+
+lr: 1e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+
+# Standard hyperparameter settings for LM, as used in Llama
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.1
+
+# Hyperparams - Puzzle embeddings training
+puzzle_emb_lr: 1e-2
+
+seed: 0
+min_eval_interval: 0 # when to start the eval
+
+ema: False # use Exponential-Moving-Average
+ema_rate: 0.999 # EMA-rate
+freeze_weights: False # If True, freeze weights and only learn the embeddings
+```
+
+File: models/recursive_reasoning/trm.py
+==================================================
+```python
+from typing import Tuple, List, Dict, Optional
+from dataclasses import dataclass
+import math
+from einops import repeat
+import torch
+import copy
+import torch.nn.functional as F
+from torch import nn
+from pydantic import BaseModel
+import random
+from models.common import trunc_normal_init_
+from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.sparse_embedding import CastedSparseEmbedding
+
+IGNORE_LABEL_ID = -100
+
+# State passed between inner loops
+
+
+@dataclass
+class TRMLatents:
+    z_H: torch.Tensor
+    z_L: torch.Tensor
+
+
+# State passed betewen outer loops
+@dataclass
+class TRMState:
+    latents: TRMLatents
+
+    steps: torch.Tensor
+    halted: torch.Tensor
+
+    current_data: Dict[str, torch.Tensor]
+
+
+class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
+    batch_size: int
+    seq_len: int
+    puzzle_emb_ndim: int = 0
+    num_puzzle_identifiers: int
+    vocab_size: int
+
+    H_cycles: int
+    L_cycles: int
+
+    H_layers: int  # ignored
+    L_layers: int
+
+    # Transformer config
+    hidden_size: int
+    expansion: float
+    num_heads: int
+    pos_encodings: str
+
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+
+    # Halting Q-learning config
+    halt_max_steps: int
+    halt_exploration_prob: float
+
+    forward_dtype: str = "bfloat16"
+
+    # Alexia: added
+    mlp_t: bool = False  # use mlp on L instead of transformer
+    puzzle_emb_len: int = 16  # if non-zero, its specified to this value
+    # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    no_ACT_continue: bool = True
+
+    force_max_steps_at_eval: bool
+    time_embeddings: bool
+
+
+class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+        super().__init__()
+
+        self.config = config
+        if self.config.mlp_t:
+            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -
+                                    self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+            self.mlp_t = SwiGLU(
+                hidden_size=self.config.seq_len + self.puzzle_emb_len,  # L
+                expansion=config.expansion,
+            )
+        else:
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=False
+            )
+        self.mlp = SwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion,
+        )
+        self.norm_eps = config.rms_norm_eps
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        # B, L, D = hidden_states.shape
+        # Post Norm
+        if self.config.mlp_t:
+            hidden_states = hidden_states.transpose(1, 2)
+            out = self.mlp_t(hidden_states)
+            hidden_states = rms_norm(
+                hidden_states + out, variance_epsilon=self.norm_eps)
+            hidden_states = hidden_states.transpose(1, 2)
+        else:
+            # Self Attention
+            hidden_states = rms_norm(hidden_states + self.self_attn(
+                cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        # Fully Connected
+        out = self.mlp(hidden_states)
+        hidden_states = rms_norm(
+            hidden_states + out, variance_epsilon=self.norm_eps)
+        return hidden_states
+
+# Wrapper for multiple Blocks; represented by f in the paper
+
+
+class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config, layers: List[TinyRecursiveReasoningModel_ACTV1Block]):
+        super().__init__()
+        self.config = config
+        self.layers = torch.nn.ModuleList(layers)
+        
+        if config.time_embeddings:
+            embed_init_std = 1.0 / math.sqrt(self.config.hidden_size)
+            self.inner_step_emb = CastedEmbedding(
+                num_embeddings = self.config.L_cycles + 1,
+                embedding_dim = self.config.hidden_size,
+                init_std = embed_init_std,
+                cast_to = getattr(torch, self.config.forward_dtype)
+            )
+            self.act_step_emb = CastedEmbedding(
+                num_embeddings = self.config.halt_max_steps,
+                embedding_dim = self.config.hidden_size,
+                init_std = embed_init_std,
+                cast_to = getattr(torch, self.config.forward_dtype)
+            )
+
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, inner_step_num: torch.Tensor, act_step_num: torch.Tensor, **kwargs) -> torch.Tensor:
+        hidden_states = hidden_states + input_injection
+        if self.config.time_embeddings:
+            hidden_states = hidden_states + self.inner_step_emb(inner_step_num)[:, None, :]
+            hidden_states = hidden_states + self.act_step_emb(act_step_num)[:, None, :]
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        return hidden_states
+
+
+# Stacks multiple ReasoningModules, each with multiple Blocks, and wraps with I/O layers
+# forward() runs one outer loop (H_cycles - 1 inner loops without grad + 1 inner loop with grad)
+class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+        super().__init__()
+        self.config = config
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+
+        # I/O
+
+        self.embed_scale = math.sqrt(self.config.hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        self.embed_tokens = CastedEmbedding(
+            self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        self.lm_head = CastedLinear(
+            self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
+
+        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -
+                                self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
+        if self.config.puzzle_emb_ndim > 0:
+            # Zero init puzzle embeddings
+            self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
+                                                    batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
+
+        # LM Blocks
+        if self.config.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
+                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                                              base=self.config.rope_theta)
+        elif self.config.pos_encodings == "learned":
+            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len,
+                                             self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        else:
+            pass
+
+        # Reasoning Layers
+        self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(
+            config=self.config,
+            layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+
+        # Initial states
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(
+            self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(
+            self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+
+        # Q head special init
+        # Init Q to (almost) zero for faster learning during bootstrapping
+        with torch.no_grad():
+            self.q_head.weight.zero_()
+            self.q_head.bias.fill_(-5)  # type: ignore
+
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+        # Token embedding
+        embedding = self.embed_tokens(input.to(torch.int32))
+
+        # Puzzle embeddings
+        if self.config.puzzle_emb_ndim > 0:
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
+
+            pad_count = self.puzzle_emb_len * \
+                self.config.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+
+            embedding = torch.cat(
+                (puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+
+        # Position embeddings
+        if self.config.pos_encodings == "learned":
+            # scale by 1/sqrt(2) to maintain forward variance
+            embedding = 0.707106781 * \
+                (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
+
+        # Scale
+        return self.embed_scale * embedding
+
+    def initial_latents(self, batch_size: int):
+        return TRMLatents(
+            z_H = repeat(self.H_init, "D -> B L D", B=batch_size, L = self.config.seq_len + self.puzzle_emb_len),
+            z_L = repeat(self.L_init, "D -> B L D", B=batch_size, L = self.config.seq_len + self.puzzle_emb_len)
+        )
+
+    def reset_halted_latents(self, reset_flag: torch.Tensor, latents: TRMLatents):
+        return TRMLatents(
+            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, latents.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, latents.z_L),
+        )
+
+    def forward(self, latents: TRMLatents, batch: Dict[str, torch.Tensor], act_step_num: torch.Tensor) -> Tuple[TRMLatents, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        seq_info = dict(
+            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+        )
+
+        # Input encoding
+        input_embeddings = self._input_embeddings(
+            batch["inputs"], batch["puzzle_identifiers"])
+
+        # Forward iterations
+        it = 0
+        z_H, z_L = latents.z_H, latents.z_L
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _H_step in range(self.config.H_cycles-1):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings,
+                        torch.ones_like(act_step_num) * _L_step, act_step_num, **seq_info)
+                z_H = self.L_level(z_H, z_L, 
+                    torch.ones_like(act_step_num) * self.config.L_cycles, act_step_num, **seq_info)
+        # 1 with grad
+        for _L_step in range(self.config.L_cycles):
+            z_L = self.L_level(z_L, z_H + input_embeddings, 
+                torch.ones_like(act_step_num) * _L_step, act_step_num, **seq_info)
+        z_H = self.L_level(z_H, z_L, 
+            torch.ones_like(act_step_num) * self.config.L_cycles, act_step_num, **seq_info)
+
+        # LM Outputs
+        new_latents = TRMLatents(
+            z_H=z_H.detach(), z_L=z_L.detach())  # New latents no grad
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        # Q-head; uses the first puzzle_emb position
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        return new_latents, output, (q_logits[..., 0], q_logits[..., 1])
+
+
+# Wraps Inner
+class TinyRecursiveReasoningModel_ACTV1(nn.Module):
+    """ACT wrapper."""
+
+    def __init__(self, config_dict: dict):
+        super().__init__()
+        self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
+        self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(self.config)
+
+    @property
+    def puzzle_emb(self):
+        return self.inner.puzzle_emb
+
+    def initial_state_train(self, batch: Dict[str, torch.Tensor]):
+        batch_size = batch["inputs"].shape[0]
+        return TRMState(
+            latents=self.inner.initial_latents(batch_size),
+            steps=torch.zeros((batch_size, ), dtype=torch.int32),
+            halted=torch.ones((batch_size, ), dtype=torch.bool),
+            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+        )
+
+    def initial_state_eval(self, batch: Dict[str, torch.Tensor]):
+        batch_size = batch["inputs"].shape[0]
+        return TRMState(
+            latents=self.inner.initial_latents(batch_size),
+            steps=torch.zeros((batch_size, ), dtype=torch.int32),
+            halted=torch.zeros((batch_size, ), dtype=torch.bool),
+            current_data=batch
+        )
+
+    def _forward_train(self, 
+        state: TRMState, 
+        batch: Dict[str, torch.Tensor]
+    )-> Tuple[TRMState, Dict[str, torch.Tensor]]:
+
+        # Prepare halted batch positions for new puzzles
+        latents = self.inner.reset_halted_latents(state.halted, state.latents)
+        steps = torch.where(state.halted, 0, state.steps)
+        data = {
+            k: torch.where(
+                state.halted.view(
+                    (-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v,
+            )
+            for k, v in state.current_data.items()
+        }
+
+        # Run the model to get new latents and outputs
+        new_latents, logits, (q_halt_logits, _) = self.inner(latents, data, steps)
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+        }
+
+        # Handle step update logic with exploration
+        with torch.no_grad():
+            steps = steps + 1
+            halted = (steps >= self.config.halt_max_steps) | (q_halt_logits > 0)
+            min_halt_steps = (
+                torch.rand_like(
+                    q_halt_logits) < self.config.halt_exploration_prob
+                    ) * torch.randint_like(steps, low=2, high=self.config.halt_max_steps + 1)
+            halted = halted & (steps >= min_halt_steps)
+
+        # Update model state
+        new_latents = TRMLatents(z_H=new_latents.z_H.detach(), z_L=new_latents.z_L.detach())
+        return TRMState(latents=new_latents, steps=steps, halted=halted, current_data=data), outputs
+    
+    def _forward_eval(self, 
+        state: TRMState, 
+        batch: Dict[str, torch.Tensor],
+        prev_outputs: Optional[Dict[str, torch.Tensor]]
+    )-> Tuple[TRMState, Dict[str, torch.Tensor]]:
+
+        active = ~state.halted
+        old_z_L, old_z_H = state.latents.z_L, state.latents.z_H
+
+        # Run the model to get new latents and outputs
+        new_latents, logits, (q_halt_logits, _) = self.inner(state.latents, batch, state.steps)
+        if not prev_outputs:
+            outputs = {
+                "logits": logits,
+                "q_halt_logits": q_halt_logits,
+            }
+        else:
+            outputs = {
+                "logits": torch.where(active[:, None, None], logits, prev_outputs["logits"]),
+                "q_halt_logits": torch.where(active, q_halt_logits, prev_outputs["q_halt_logits"]),
+            }
+
+        # Handle step update logic
+        steps = state.steps
+        with torch.no_grad():
+            steps = torch.where(active, steps + 1, steps)
+            halted = state.halted | (steps >= self.config.halt_max_steps) | (q_halt_logits > 0)
+        
+        # Update model state
+        new_latents = TRMLatents(
+            z_H=torch.where(active[:, None, None], new_latents.z_H, old_z_H).detach(), 
+            z_L=torch.where(active[:, None, None], new_latents.z_L, old_z_L).detach())
+        return TRMState(latents=new_latents, steps=steps, halted=halted, current_data=batch), outputs
+
+
+    def forward(self, 
+        state: TRMState, 
+        batch: Dict[str, torch.Tensor],
+        prev_outputs: Optional[Dict[str, torch.Tensor]] = None,
+    )-> Tuple[TRMState, Dict[str, torch.Tensor]]:
+        if self.training:
+            return self._forward_train(state, batch)
+        else:
+            return self._forward_eval(state, batch, prev_outputs)
+
+    # def forward(
+    #     self,
+    #     carry: TRMState,
+    #     batch: Dict[str, torch.Tensor],
+    # ) -> Tuple[TRMState, Dict[str, torch.Tensor]]:
+
+    #     if self.training:
+    #         new_latents = self.inner.reset_halted_latents(
+    #             carry.halted, carry.latents)
+    #         new_steps = torch.where(carry.halted, 0, carry.steps)
+    #         new_current_data = {
+    #             k: torch.where(
+    #                 carry.halted.view(
+    #                     (-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v,
+    #             )
+    #             for k, v in carry.current_data.items()
+    #         }
+    #     else:
+    #         new_latents = carry.latents
+    #         new_steps = carry.steps
+    #         new_current_data = batch
+
+    #     new_latents_step, logits, (q_halt_logits, q_continue_logits) = self.inner(
+    #         new_latents, new_current_data
+    #     )
+
+    #     outputs = {
+    #         "logits": logits,
+    #         "q_halt_logits": q_halt_logits,
+    #         "q_continue_logits": q_continue_logits,
+    #     }
+
+    #     with torch.no_grad():
+    #         if self.training:
+    #             new_steps = new_steps + 1
+    #             is_last_step = new_steps >= self.config.halt_max_steps
+
+    #             if self.config.halt_max_steps > 1:
+    #                 if self.config.no_ACT_continue:
+    #                     halted = is_last_step | (q_halt_logits > 0)
+    #                 else:
+    #                     halted = is_last_step | (
+    #                         q_halt_logits > q_continue_logits)
+    #                 min_halt_steps = (
+    #                     torch.rand_like(
+    #                         q_halt_logits) < self.config.halt_exploration_prob
+    #                 ) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+    #                 halted = halted & (new_steps >= min_halt_steps)
+
+    #                 if not self.config.no_ACT_continue:
+    #                     # Target Q for continue
+    #                     _, _, (next_q_halt_logits, next_q_continue_logits) = self.inner(
+    #                         new_latents_step, new_current_data
+    #                     )
+    #                     outputs["target_q_continue"] = torch.sigmoid(
+    #                         torch.where(
+    #                             is_last_step,
+    #                             next_q_halt_logits,
+    #                             torch.maximum(next_q_halt_logits,
+    #                                           next_q_continue_logits),
+    #                         )
+    #                     )
+
+    #         else:
+    #             # Only increment steps for sequences that were not already halted
+    #             new_steps = new_steps + (~carry.halted).to(new_steps.dtype)
+    #             is_last_step = new_steps >= self.config.halt_max_steps
+
+    #             if self.config.halt_max_steps > 1 and not self.config.force_max_steps_at_eval:
+    #                 if self.config.no_ACT_continue:
+    #                     halted = is_last_step | (q_halt_logits > 0)
+    #                 else:
+    #                     halted = is_last_step | (
+    #                         q_halt_logits > q_continue_logits
+    #                     )
+
+    #             halted = carry.halted | halted
+
+    #     if self.training:
+    #         final_latents = TRMLatents(
+    #             z_H=new_latents_step.z_H.detach(),
+    #             z_L=new_latents_step.z_L.detach(),
+    #         )
+    #     else:
+    #         # Eval:
+    #         # - For sequences that were already halted at the previous step,
+    #         #   keep their old z_H/z_L.
+    #         # - For sequences that just halted now or are still active,
+    #         #   use the newly computed z_H/z_L from this step.
+    #         # uses *previous* halted
+    #         keep_old_mask = carry.halted.view(-1, 1, 1)
+    #         z_H = torch.where(keep_old_mask, carry.latents.z_H,
+    #                           new_latents_step.z_H).detach()
+    #         z_L = torch.where(keep_old_mask, carry.latents.z_L,
+    #                           new_latents_step.z_L).detach()
+    #         final_latents = TRMLatents(
+    #             z_H=z_H, z_L=z_L
+    #         )
+
+    #     new_carry = TRMState(
+    #         latents=final_latents,
+    #         steps=new_steps,
+    #         halted=halted,
+    #         current_data=new_current_data,
+    #     )
+
+    #     return new_carry, outputs
+```
+
+File: models/recursive_reasoning/gtrm.py
+==================================================
+```python
+from typing import Iterable, Tuple, List, Dict, Optional
+from dataclasses import dataclass
+import math
+import torch
+import torch.nn.functional as F
+from torch import nn
+from pydantic import BaseModel
+from models.common import trunc_normal_init_
+from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.sparse_embedding import CastedSparseEmbedding
+from einops import rearrange, repeat
+
+IGNORE_LABEL_ID = -100
+
+# State passed between inner loops
+
+@dataclass
+class GTRMLatents:
+    z_H: torch.Tensor
+    z_L: torch.Tensor
+
+
+# State passed betewen outer loops
+@dataclass
+class GTRMState:
+    latents: GTRMLatents
+
+    steps: torch.Tensor
+    halted: torch.Tensor
+
+    current_data: Dict[str, torch.Tensor]
+
+
+class GTRMConfig(BaseModel):
+    batch_size: int
+    seq_len: int
+    puzzle_emb_ndim: int = 0
+    num_puzzle_identifiers: int # 1
+    vocab_size: int
+
+    H_cycles: int
+    L_cycles: int
+
+    H_layers: int # ignored
+    L_layers: int
+
+    # Transformer config
+    hidden_size: int
+    expansion: float
+    num_heads: int
+    pos_encodings: str
+
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+    
+    # Halting Q-learning config
+    halt_max_steps: int
+    halt_exploration_prob: float
+
+    forward_dtype: str = "bfloat16"
+
+    # Alexia: added
+    mlp_t: bool = False # use mlp on L instead of transformer
+    puzzle_emb_len: int = 16 # if non-zero, its specified to this value
+    no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    log_sigma_head_init_bias: float = -5.0 # Initial bias for log_sigma head (negative = small sigma initially)
+
+    # Added to GTRM
+    q_head_input_detached: bool
+    q_head_input_form: str # "intermediate output" for un-embedded z_H or "first puzzle emb" for z_H[:, 0, :] (original)
+    H_deterministic_mode: str # "separate weights" or "skip noise" or "False"
+
+    force_max_steps_at_eval: bool # If True, model always runs full number of inference steps during eval
+    time_embeddings: bool
+
+class GTRMBlock(nn.Module):
+    """
+    (B, L, D) -> B, L, D
+    """
+    def __init__(self, config: GTRMConfig) -> None:
+        super().__init__()
+
+        self.config = config
+        if self.config.mlp_t:
+            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+            self.mlp_t = SwiGLU( # "MLP in sequence's time dimension"
+                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L
+                expansion=config.expansion,
+            ) # L -> L
+        else:
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=False
+            )
+        self.mlp = SwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion,
+        )
+        self.norm_eps = config.rms_norm_eps
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Post Norm
+        if self.config.mlp_t:
+            hidden_states = rearrange(hidden_states, "B L D -> B D L")
+            out = self.mlp_t(hidden_states)
+            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+            hidden_states = rearrange(hidden_states, "B D L -> B L D")
+        else:
+            # Self Attention
+            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        # Fully Connected
+        out = self.mlp(hidden_states)
+        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        return hidden_states
+
+class GTRMReasoningModule(nn.Module):
+    """
+    (B, L, D) -> (B, L, D)
+    """
+    def __init__(self, config: GTRMConfig, layers: List[GTRMBlock], gaussian: bool):
+        super().__init__()
+        self.config = config
+        self.layers = torch.nn.ModuleList(layers)
+        self.gaussian = gaussian
+        if gaussian:
+            self.mu_head = CastedLinear(
+                self.config.hidden_size,
+                self.config.hidden_size,
+                bias=True,
+            )
+            # sigma in log-space to guarantee positive sigma
+            self.log_sigma_head = CastedLinear(
+                self.config.hidden_size,
+                self.config.hidden_size,
+                bias=True,
+            )
+            # might help early stability to start with small sigma
+            with torch.no_grad():
+                self.log_sigma_head.bias.fill_(self.config.log_sigma_head_init_bias)
+
+        if config.time_embeddings:
+            embed_init_std = 1.0 / math.sqrt(self.config.hidden_size)
+            self.inner_step_emb = CastedEmbedding(
+                num_embeddings = self.config.L_cycles + 1,
+                embedding_dim = self.config.hidden_size,
+                init_std = embed_init_std,
+                cast_to = getattr(torch, self.config.forward_dtype)
+            )
+            self.act_step_emb = CastedEmbedding(
+                num_embeddings = self.config.halt_max_steps,
+                embedding_dim = self.config.hidden_size,
+                init_std = embed_init_std,
+                cast_to = getattr(torch, self.config.forward_dtype)
+            )
+
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, inner_step_num: torch.Tensor, act_step_num: torch.Tensor, skip_noise: bool = False, **kwargs) -> torch.Tensor:
+        """
+        skip_noise lets us reuse mu for both z_L and z_H but only add mu * eps to z_L
+        """
+        hidden_states = hidden_states + input_injection
+        if self.config.time_embeddings:
+            hidden_states = hidden_states + self.inner_step_emb(inner_step_num)[:, None, :]
+            hidden_states = hidden_states + self.act_step_emb(act_step_num)[:, None, :]
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        if self.gaussian:
+            mu = self.mu_head(hidden_states)
+            if not skip_noise:
+                log_sigma = self.log_sigma_head(hidden_states)
+                hidden_states = mu + torch.exp(log_sigma) * torch.randn_like(log_sigma)
+            else:
+                hidden_states = mu
+        return hidden_states
+
+class GTRM_Inner(nn.Module):
+    def __init__(self, config: GTRMConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+
+        # I/O
+
+        self.embed_scale = math.sqrt(self.config.hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        if config.q_head_input_form == "first puzzle emb":
+            self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        elif config.q_head_input_form == "intermediate output":
+            self.q_head = CastedLinear(self.config.seq_len * self.config.vocab_size, 2, bias=True)
+        else:
+            raise ValueError(f"Unknown q_head_input_form: {config.q_head_input_form}. Must be 'first puzzle emb' or 'intermediate output'")
+
+        self.q_head_input_form = config.q_head_input_form
+        self.q_head_input_detached = config.q_head_input_detached
+
+        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
+        if self.config.puzzle_emb_ndim > 0:
+            # Zero init puzzle embeddings
+            self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
+                                                    batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
+
+        # LM Blocks
+        if self.config.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
+                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                                              base=self.config.rope_theta)
+        elif self.config.pos_encodings == "learned":
+            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        else:
+            pass
+
+        # Reasoning Layers
+        self.L_level = GTRMReasoningModule(config=self.config, layers=[GTRMBlock(self.config) for _i in range(self.config.L_layers)], gaussian=True)
+        if self.config.H_deterministic_mode == "separate weights":
+            self.H_level = GTRMReasoningModule(config=self.config, layers=[GTRMBlock(self.config) for _i in range(self.config.L_layers)], gaussian=False)
+
+        # Initial states
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+
+        # Q head special init
+        # Init Q to (almost) zero for faster learning during bootstrapping
+        with torch.no_grad():
+            self.q_head.weight.zero_()
+            self.q_head.bias.fill_(-5)  # type: ignore
+
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+        """
+        input: (B, seq_len)
+        puzzle_identifiers: (B)
+        """
+
+        # Token embedding
+        embedding = self.embed_tokens(input.to(torch.int32)) # (B,)
+
+        # Puzzle embeddings
+        if self.config.puzzle_emb_ndim > 0:
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers) # (B, D)
+            #                emb_len        * D                       - D = (emb_len - 1) * D
+            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count)) # (B, (embed_len) * D) with 0's on the right
+
+            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+
+        # Position embeddings
+        if self.config.pos_encodings == "learned":
+            # scale by 1/sqrt(2) to maintain forward variance
+            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
+
+        # Scale
+        return self.embed_scale * embedding
+
+    def initial_latents(self, batch_size: int):
+        return GTRMLatents(
+            z_H = repeat(self.H_init, "D -> B L D", B=batch_size, L = self.config.seq_len + self.puzzle_emb_len),
+            z_L = repeat(self.L_init, "D -> B L D", B=batch_size, L = self.config.seq_len + self.puzzle_emb_len)
+        )
+
+    def reset_halted_latents(self, reset_flag: torch.Tensor, latents: GTRMLatents):
+        return GTRMLatents(
+            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, latents.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, latents.z_L),
+        )
+
+    def iterate_H(self, z_H, z_L, inner_step_num, act_step_num, seq_info):
+        """
+        Map z_H + z_L -> z_H
+        """
+        if self.config.H_deterministic_mode == "skip noise":
+            z_H = self.L_level(z_H, z_L, inner_step_num, act_step_num, skip_noise=True, **seq_info)
+        elif self.config.H_deterministic_mode == "separate weights":
+            z_H = self.H_level(z_H, z_L, inner_step_num, act_step_num, **seq_info)
+        else:
+            assert self.config.H_deterministic_mode == "False"
+            z_H = self.L_level(z_H, z_L, inner_step_num, act_step_num, **seq_info)
+        return z_H
+
+    def forward(self, latents: GTRMLatents, batch: Dict[str, torch.Tensor], act_step_num: torch.Tensor) -> Tuple[GTRMLatents, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        seq_info = dict(
+            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+        )
+
+        # Input encoding
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+
+        # Forward iterations
+        z_H, z_L = latents.z_H, latents.z_L
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _H_step in range(self.config.H_cycles-1):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings,
+                        torch.ones_like(act_step_num) * _L_step, act_step_num, **seq_info)
+                z_H = self.iterate_H(z_H, z_L, 
+                    torch.ones_like(act_step_num) * self.config.L_cycles, act_step_num, seq_info)
+        # 1 with grad
+        for _L_step in range(self.config.L_cycles):
+            z_L = self.L_level(z_L, z_H + input_embeddings, 
+                torch.ones_like(act_step_num) * _L_step, act_step_num, **seq_info)
+        z_H = self.iterate_H(z_H, z_L, 
+            torch.ones_like(act_step_num) * self.config.L_cycles, act_step_num, seq_info)
+
+        # LM Outputs
+        new_latents = GTRMLatents(z_H=z_H.detach(), z_L=z_L.detach())  # New latents no grad
+        # z_H shape (B, puzzle_emb_len + seq_len, D)
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:] # (B, seq_len, vocab_size)
+        if self.q_head_input_form == "intermediate output":
+            q_head_input = rearrange(output, "B L V -> B (L V)")
+        elif self.q_head_input_form == "first puzzle emb":
+            q_head_input = z_H[:, 0, :] # shape (B, D)
+        else:
+            raise ValueError("Unknown q_head_input_form", self.q_head_input_form)
+        if self.q_head_input_detached:
+            q_head_input = q_head_input.detach()
+        q_logits = self.q_head(q_head_input).to(torch.float32)
+        return new_latents, output, (q_logits[..., 0], q_logits[..., 1])
+
+
+class GTRM(nn.Module):
+    """ACT wrapper."""
+
+    def __init__(self, config_dict: dict):
+        super().__init__()
+        self.config = GTRMConfig(**config_dict)
+        self.inner = GTRM_Inner(self.config)
+
+    @property
+    def puzzle_emb(self):
+        return self.inner.puzzle_emb
+
+    def initial_state_train(self, batch: Dict[str, torch.Tensor]):
+        batch_size = batch["inputs"].shape[0]
+        return GTRMState(
+            latents=self.inner.initial_latents(batch_size),
+            steps=torch.zeros((batch_size, ), dtype=torch.int32),
+            halted=torch.ones((batch_size, ), dtype=torch.bool),
+            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+        )
+
+    def initial_state_eval(self, batch: Dict[str, torch.Tensor]):
+        batch_size = batch["inputs"].shape[0]
+        return GTRMState(
+            latents=self.inner.initial_latents(batch_size),
+            steps=torch.zeros((batch_size, ), dtype=torch.int32),
+            halted=torch.zeros((batch_size, ), dtype=torch.bool),
+            current_data=batch
+        )
+
+    def _forward_train(self, 
+        state: GTRMState, 
+        batch: Dict[str, torch.Tensor]
+    )-> Tuple[GTRMState, Dict[str, torch.Tensor]]:
+
+        # Prepare halted batch positions for new puzzles
+        latents = self.inner.reset_halted_latents(state.halted, state.latents)
+        steps = torch.where(state.halted, 0, state.steps)
+        data = {
+            k: torch.where(
+                state.halted.view(
+                    (-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v,
+            )
+            for k, v in state.current_data.items()
+        }
+
+        # Run the model to get new latents and outputs
+        new_latents, logits, (q_halt_logits, _) = self.inner(latents, data, steps)
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+        }
+
+        # Handle step update logic with exploration
+        with torch.no_grad():
+            steps = steps + 1
+            halted = (steps >= self.config.halt_max_steps) | (q_halt_logits > 0)
+            min_halt_steps = (
+                torch.rand_like(
+                    q_halt_logits) < self.config.halt_exploration_prob
+                    ) * torch.randint_like(steps, low=2, high=self.config.halt_max_steps + 1)
+            halted = halted & (steps >= min_halt_steps)
+
+        # Update model state
+        new_latents = GTRMLatents(z_H=new_latents.z_H.detach(), z_L=new_latents.z_L.detach())
+        return GTRMState(latents=new_latents, steps=steps, halted=halted, current_data=data), outputs
+    
+    def _forward_eval(self, 
+        state: GTRMState, 
+        batch: Dict[str, torch.Tensor],
+        prev_outputs: Optional[Dict[str, torch.Tensor]]
+    )-> Tuple[GTRMState, Dict[str, torch.Tensor]]:
+
+        active = ~state.halted
+        old_z_L, old_z_H = state.latents.z_L, state.latents.z_H
+
+        # Run the model to get new latents and outputs
+        new_latents, logits, (q_halt_logits, _) = self.inner(state.latents, batch, state.steps)
+        if not prev_outputs:
+            outputs = {
+                "logits": logits,
+                "q_halt_logits": q_halt_logits,
+            }
+        else:
+            outputs = {
+                "logits": torch.where(active[:, None, None], logits, prev_outputs["logits"]),
+                "q_halt_logits": torch.where(active, q_halt_logits, prev_outputs["q_halt_logits"]),
+            }
+
+        # Handle step update logic
+        steps = state.steps
+        with torch.no_grad():
+            steps = torch.where(active, steps + 1, steps)
+            halted = state.halted | (steps >= self.config.halt_max_steps) | (q_halt_logits > 0)
+        
+        # Update model state
+        new_latents = GTRMLatents(
+            z_H=torch.where(active[:, None, None], new_latents.z_H, old_z_H).detach(), 
+            z_L=torch.where(active[:, None, None], new_latents.z_L, old_z_L).detach())
+        return GTRMState(latents=new_latents, steps=steps, halted=halted, current_data=batch), outputs
+
+
+    def forward(self, 
+        state: GTRMState, 
+        batch: Dict[str, torch.Tensor],
+        prev_outputs: Optional[Dict[str, torch.Tensor]] = None,
+    )-> Tuple[GTRMState, Dict[str, torch.Tensor]]:
+        if self.training:
+            return self._forward_train(state, batch)
+        else:
+            return self._forward_eval(state, batch, prev_outputs)
+```
+
+File: models/layers.py
+==================================================
+```python
+from typing import Tuple
+import einops
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+#try:
+#    from flash_attn_interface import flash_attn_func  # type: ignore[import]
+#except ImportError:
+#    # Fallback to FlashAttention 2
+#    from flash_attn import flash_attn_func  # type: ignore[import]
+from torch.nn.functional import scaled_dot_product_attention
+
+from models.common import trunc_normal_init_
+
+
+CosSin = Tuple[torch.Tensor, torch.Tensor]
+
+
+def _find_multiple(a, b):
+    return (-(a // -b)) * b
+
+
+def rotate_half(x: torch.Tensor):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    # q, k: [bs, seq_len, num_heads, head_dim]
+    # cos, sin: [seq_len, head_dim]
+    orig_dtype = q.dtype
+    q = q.to(cos.dtype)
+    k = k.to(cos.dtype)
+
+    q_embed = (q * cos.unsqueeze(-2)) + (rotate_half(q) * sin.unsqueeze(-2))
+    k_embed = (k * cos.unsqueeze(-2)) + (rotate_half(k) * sin.unsqueeze(-2))
+
+    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+
+
+class CastedLinear(nn.Module):
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 bias: bool):
+        super().__init__()
+        # Truncated LeCun normal init
+        self.weight = nn.Parameter(
+            trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5))
+        )
+        self.bias = None
+        if bias:
+            # Zero init bias
+            self.bias = nn.Parameter(torch.zeros((out_features, )))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+
+
+class CastedEmbedding(nn.Module):
+    def __init__(self,
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 init_std: float,
+                 cast_to: torch.dtype):
+        super().__init__()
+        self.cast_to = cast_to
+
+        # Truncated LeCun normal init
+        self.embedding_weight = nn.Parameter(
+            trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std)
+        )
+        
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.embedding(input, self.embedding_weight.to(self.cast_to))
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings, base, device=None):
+        super().__init__()
+
+        # RoPE
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached = nn.Buffer(emb.cos(), persistent=False)
+        self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
+
+    def forward(self):
+        return self.cos_cached, self.sin_cached
+
+
+class Attention(nn.Module):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.output_size = head_dim * num_heads
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.causal = causal
+
+        self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
+        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # hidden_states: [bs, seq_len, num_heads, head_dim]
+        qkv = self.qkv_proj(hidden_states)
+
+        # Split head
+        qkv = qkv.view(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        query = qkv[:, :, :self.num_heads]
+        key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
+        value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
+
+        # RoPE
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        # flash attn
+        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
+        attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
+        attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
+        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        return self.o_proj(attn_output)
+
+class LinearSwish(nn.Module):
+    def __init__(self, hidden_size: int, reverse=False):
+        super().__init__()
+
+        self.linear = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.reverse = reverse
+
+    def forward(self, x):
+        if self.reverse:
+            return F.silu(self.linear(x))
+        else:
+            return self.linear(F.silu(x))
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_size: int, expansion: float):
+        super().__init__()
+        inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+
+        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+
+    def forward(self, x):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
+def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+    return hidden_states.to(input_dtype)
+```
+
+File: models/losses.py
+==================================================
+```python
+from typing import Any, Tuple, Dict, Sequence, Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+import math
+
+IGNORE_LABEL_ID = -100
+
+
+def s(x, epsilon=1e-30):
+    return torch.where(
+        x<0,
+        1/(1-x+ epsilon),
+        x + 1
+    )
+
+
+def log_stablemax(x, dim=-1):
+    s_x = s(x)
+    return torch.log(s_x/torch.sum(s_x, dim=dim, keepdim=True))
+
+
+def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
+    logprobs = log_stablemax(logits.to(torch.float64), dim=-1)
+
+    if valid_mask is None:
+        valid_mask = (labels != ignore_index)
+    transformed_labels = torch.where(valid_mask, labels, 0)
+    prediction_logprobs = torch.gather(logprobs, index=transformed_labels.to(torch.long).unsqueeze(-1), dim=-1).squeeze(-1)
+
+    return -torch.where(valid_mask, prediction_logprobs, 0)
+
+
+def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
+    # Cast logits to f32
+    # Flatten logits
+    return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
+
+
+class ACTLossHead(nn.Module):
+    def __init__(self, model: nn.Module, loss_type: str, act_loss_weight: float):
+        super().__init__()
+        self.model = model
+        self.loss_fn = globals()[loss_type]
+        self.act_loss_weight = act_loss_weight
+        
+    def initial_state(self, *args, **kwargs):
+        if self.model.training:
+            return self.model.initial_state_train(*args, **kwargs)  # type: ignore
+        else:
+            return self.model.initial_state_eval(*args, **kwargs)  # type: ignore
+
+    def forward(
+        self,
+        return_keys: Sequence[str],
+        # Model args
+        **model_kwargs,
+    ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
+        # Model logits
+        # B x SeqLen x D
+        new_state, outputs = self.model(**model_kwargs)
+        labels = new_state.current_data["labels"]
+
+        with torch.no_grad():
+            # Preds
+            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+
+            # Correctness
+            mask = (labels != IGNORE_LABEL_ID) # (B, 81)
+            not_masked = mask.sum(-1) # (B) - all equal to 81
+            # Avoid NaNs in division
+            loss_divisor = not_masked.clamp_min(1).unsqueeze(-1) # (B, 1)
+
+            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels) #(B, 81)
+            seq_is_correct = is_correct.sum(-1) == not_masked
+            
+            # Metrics (halted)
+            valid_metrics = new_state.halted & (not_masked > 0)
+            metrics = {
+                "count": valid_metrics.sum(),
+                
+                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+
+                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
+                "steps":          torch.where(valid_metrics, new_state.steps, 0).sum(),
+            }
+
+        # Losses
+
+        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        metrics.update({
+            "lm_loss": lm_loss.detach(),
+            "q_halt_loss": q_halt_loss.detach(),
+        })
+        # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
+        q_continue_loss = 0
+        if "target_q_continue" in outputs:
+            q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
+
+            metrics["q_continue_loss"] = q_continue_loss.detach()
+        # Filter outputs for return
+        if self.model.training:
+            detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+        else:
+            detached_outputs = {k: outputs[k].detach() for k in outputs}
+
+        return new_state, lm_loss + self.act_loss_weight * 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_state.halted.all()
+
+```
+
+File: models/sparse_embedding.py
+==================================================
+```python
+from typing import Union
+
+import torch
+from torch import nn
+import torch.distributed as dist
+from torch.optim.optimizer import Optimizer, ParamsT
+
+from models.common import trunc_normal_init_
+
+
+class CastedSparseEmbedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, batch_size: int, init_std: float, cast_to: torch.dtype):
+        super().__init__()
+        self.cast_to = cast_to
+
+        # Real Weights
+        # Truncated LeCun normal init
+        self.weights = nn.Buffer(
+            trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std), persistent=True
+        )
+
+        # Local weights and IDs
+        # Local embeddings, with gradient, not persistent
+        self.local_weights = nn.Buffer(torch.zeros(batch_size, embedding_dim, requires_grad=True), persistent=False)
+        # Local embedding IDs, not persistent
+        self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int32), persistent=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            # Test mode, no gradient
+            return self.weights[inputs].to(self.cast_to)
+            
+        # Training mode, fill puzzle embedding from weights
+        with torch.no_grad():
+            self.local_weights.copy_(self.weights[inputs])
+            self.local_ids.copy_(inputs)
+
+        return self.local_weights.to(self.cast_to)
+
+
+class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
+    def __init__(
+        self,
+        params: ParamsT,
+
+        world_size: int,
+        lr: Union[float, torch.Tensor] = 1e-3,
+        weight_decay: float = 1e-2,
+    ):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            world_size=world_size
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad
+    def step(self, closure=None):  # type: ignore
+        for group in self.param_groups:
+            # Find the sparse embedding weights
+            local_weights_grad = None
+            local_ids = None
+            weights = None
+            
+            assert len(group["params"]) == 3
+            for p in group["params"]:
+                if p.requires_grad:
+                    local_weights_grad = p.grad
+                elif p.ndim == 1:
+                    local_ids = p
+                elif p.ndim == 2:
+                    weights = p
+                else:
+                    assert False
+                
+            assert local_ids is not None
+            assert weights is not None
+        
+            # Apply SignSGD
+            # Adam ≈ SignSGD if gradient is very sparse
+            if local_weights_grad is not None:
+                _sparse_emb_signsgd_dist(
+                    local_weights_grad,
+                    local_ids,
+                    weights,
+                    
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    world_size=group["world_size"]
+                )
+
+
+def _sparse_emb_signsgd_dist(
+    local_weights_grad: torch.Tensor,
+    local_ids: torch.Tensor,
+    weights: torch.Tensor,
+    
+    lr: float,
+    weight_decay: float,
+    world_size: int
+) -> None:
+    N, D = local_weights_grad.shape
+    
+    # All-gather
+    all_weights_grad = local_weights_grad
+    all_ids = local_ids
+
+    if world_size > 1:
+        all_weights_grad = torch.empty((world_size * N, D), dtype=local_weights_grad.dtype, device=local_weights_grad.device)
+        all_ids = torch.empty(world_size * N,               dtype=local_ids.dtype,          device=local_ids.device)
+    
+        dist.all_gather_into_tensor(all_weights_grad, local_weights_grad)
+        dist.all_gather_into_tensor(all_ids,          local_ids)
+
+    # Unique
+    grad_ids, inv = all_ids.unique(return_inverse=True)
+
+    grad = torch.zeros((grad_ids.shape[0], D), dtype=all_weights_grad.dtype, device=all_weights_grad.device)
+    grad.scatter_add_(0, inv.unsqueeze(-1).expand(-1, D), all_weights_grad)
+
+    # SignSGD with decoupled weight decay
+    p = weights[grad_ids]
+
+    p.mul_(1.0 - lr * weight_decay).add_(torch.sign(grad), alpha=-lr)
+
+    # Write updated slices back
+    weights[grad_ids] = p
+```
+
+File: rloo.py
+==================================================
+```python
+from typing import Tuple, Dict
+import torch
+import torch.distributions as dist
+from einops import rearrange
+
+def get_distribution_params(reasoning_module, hidden_states):
+    """ Returns mu, sigma """
+    mu = reasoning_module.mu_head(hidden_states)
+    log_sigma = reasoning_module.log_sigma_head(hidden_states)
+    assert not torch.isnan(mu).any()
+    assert not torch.isnan(log_sigma).any()
+    log_sigma = torch.clamp(log_sigma, min=-3, max=2)
+    sigma = torch.exp(log_sigma)
+    assert not torch.isnan(sigma).any()
+    return mu, sigma
+
+# JIT CAUSES NAN GRADIENTS FOR REASONS ONLY KNOWN TO GOD
+# @torch.jit.script # fuse element-wise operations automatically
+def manual_gaussian_log_prob(x, mu, sigma):
+    # Constant for 0.5 * log(2pi)
+    log_2pi = 1.837877
+
+    # Add epsilon to sigma to prevent DivBackward0 (Gradient explosion on sigma -> 0)
+    # Even if sigma is clamped > 0, the gradient 1/sigma can be huge.
+    safe_sigma = sigma + 1e-5
+    
+    var = safe_sigma.pow(2)
+    log_scale = torch.log(safe_sigma)
+    
+    # (x - mu)^2 / 2sigma^2
+    # Detach x so gradients don't try to move the sample
+    diff = x.detach() - mu    
+    exp_term = -(diff.pow(2)) / (2 * var)
+    
+    log_prob = exp_term - log_scale - 0.5 * log_2pi
+    return torch.clamp(log_prob, min=-1000.0) # prevent Inf from propagating to gradients when using jit
+
+def run_forward_step(
+    inner_model, 
+    z_L, 
+    z_H, 
+    input_embeddings, 
+    seq_info, 
+    act_step_num
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dist.Categorical, Dict[str, torch.Tensor]]:
+    """
+    Runs one forward step. 
+    Returns: new_z_L, new_z_H, step_log_prob, halt_dist
+    """
+    cfg = inner_model.config
+    step_log_prob = 0.0
+    
+    curr_z_L = z_L
+
+    z_L_entropies = []
+    z_L_sigmas = []
+    z_H_entropies = []
+    z_H_sigmas = []
+    
+    # 1. Latent Reasoning (L_cycles)
+    for _L_step in range(cfg.L_cycles):
+        module = inner_model.L_level
+        h_input = curr_z_L
+        input_injection = z_H + input_embeddings
+        inner_step_tensor = torch.ones_like(act_step_num) * _L_step
+        
+        hidden = h_input + input_injection
+        if cfg.time_embeddings:
+            hidden = hidden + module.inner_step_emb(inner_step_tensor)[:, None, :]
+            hidden = hidden + module.act_step_emb(act_step_num)[:, None, :]
+            
+        for layer in module.layers:
+            hidden = layer(hidden_states=hidden, **seq_info)
+        
+        mu, sigma = get_distribution_params(module, hidden)
+        dist_L = dist.Normal(mu, sigma)
+
+        z_L_entropies.append(dist_L.entropy().mean())
+        z_L_sigmas.append(sigma.mean())
+        
+        # RLOO only uses the log_probs of the sampled actions
+        # So we sample, calculate log_prob, and that log_prob is the computational graph leaf.
+        new_z_L = dist_L.sample()
+        
+        # Sum log probs over dimensions: (B, L_cycles, D) -> (B,)
+        # step_log_prob = step_log_prob + dist_L.log_prob(new_z_L).sum(dim=(-1, -2))
+        step_log_prob = step_log_prob + manual_gaussian_log_prob(new_z_L, mu, sigma).sum(dim=(-1,-2))
+        curr_z_L = new_z_L
+
+    # 2. H-Level Prediction
+    if cfg.H_deterministic_mode == "separate weights":
+        h_module = inner_model.H_level
+    else:
+        h_module = inner_model.L_level
+
+    inner_step_tensor = torch.ones_like(act_step_num) * cfg.L_cycles
+    hidden = z_H + curr_z_L 
+    
+    if cfg.time_embeddings:
+        hidden = hidden + h_module.inner_step_emb(inner_step_tensor)[:, None, :]
+        hidden = hidden + h_module.act_step_emb(act_step_num)[:, None, :]
+        
+    for layer in h_module.layers:
+        hidden = layer(hidden_states=hidden, **seq_info)
+        
+    # 3. Action (z_H)
+    if h_module.gaussian:
+        mu, sigma = get_distribution_params(h_module, hidden)
+        if h_module.config.H_deterministic_mode == "skip noise":
+            dist_z = dist.Normal(mu, 0)
+        else:
+            dist_z = dist.Normal(mu, sigma)
+            z_H_entropies.append(dist_z.entropy().mean())
+            z_H_sigmas.append(sigma.mean())
+            
+        new_z_H = dist_z.sample()
+        log_prob_z = manual_gaussian_log_prob(new_z_H, mu, sigma).sum(dim=(-1,-2))
+        step_log_prob = step_log_prob + log_prob_z
+    else: 
+        new_z_H = hidden
+
+    # 4. Halting
+    if inner_model.q_head_input_form == "intermediate output":
+        output = inner_model.lm_head(new_z_H)[:, inner_model.puzzle_emb_len:]
+        q_in = rearrange(output, "b l v -> b (l v)")
+    else: 
+        q_in = new_z_H[:, 0, :]
+        
+    if inner_model.q_head_input_detached:
+        q_in = q_in.detach()
+    
+    q_logits = inner_model.q_head(q_in) # logits for (halt, continue)
+    q_logits = torch.nan_to_num(q_logits, nan=-10)
+    halt_dist = dist.Categorical(logits=q_logits)
+
+    exploration_metrics = {
+        "z_L_entropy": torch.stack(z_L_entropies).mean() if z_L_entropies else torch.tensor(0.0, device=z_L.device),
+        "z_L_sigma": torch.stack(z_L_sigmas).mean() if z_L_sigmas else torch.tensor(0.0, device=z_L.device),
+        "z_H_entropy": torch.stack(z_H_entropies).mean() if z_H_entropies else torch.tensor(0.0, device=z_L.device),
+        "z_H_sigma": torch.stack(z_H_sigmas).mean() if z_H_sigmas else torch.tensor(0.0, device=z_L.device),
+    }
+    
+    return curr_z_L, new_z_H, step_log_prob, halt_dist, exploration_metrics, q_logits
+```
+
+File: pretrain.py
+==================================================
+```python
+from typing import Optional, Any, Sequence, List
+from dataclasses import dataclass
+import os
+import math
+import yaml
+import shutil
+import copy
+
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.utils.data import DataLoader
+
+import datetime
+import tqdm
+import wandb
+import coolname
+import hydra
+import pydantic
+from omegaconf import DictConfig
+from adam_atan2_pytorch import AdamAtan2
+
+from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from utils.functions import (
+    load_model_class,
+    get_model_source_path,
+    sample_dataset_batch_indices,
+)
+from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from models.ema import EMAHelper
+from models.recursive_reasoning.gtrm import GTRMState
+
+
+class LossConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    name: str
+
+
+class ArchConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    name: str
+    loss: LossConfig
+
+
+class EvaluatorConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    name: str
+
+
+class PretrainConfig(pydantic.BaseModel):
+    # Config
+    arch: ArchConfig
+    # Data
+    data_paths: List[str]
+    data_paths_test: List[str] = []
+    # Evaluators
+    evaluators: List[EvaluatorConfig] = []
+
+    # Hyperparams
+    global_batch_size: int
+    epochs: int
+
+    lr: float
+    lr_min_ratio: float
+    lr_warmup_steps: int
+
+    weight_decay: float
+    beta1: float
+    beta2: float
+
+    # Puzzle embedding
+    puzzle_emb_lr: float
+    puzzle_emb_weight_decay: float
+
+    # Names
+    project_name: Optional[str] = None
+    run_name: Optional[str] = None
+    load_checkpoint: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+
+    # Extras
+    seed: int = 0
+    checkpoint_every_eval: bool = False
+    eval_interval: Optional[int] = None
+    min_eval_interval: Optional[int] = 0  # when to start eval
+    eval_save_outputs: List[str] = []
+    eval_dataset_fraction: Optional[float] = (
+        None  # how much of the test dataset to use at each eval
+    )
+    eval_max_batches: Optional[int] = None
+
+    ema: bool = False  # use Exponential-Moving-Average
+    ema_rate: float = 0.999  # EMA-rate
+    freeze_weights: bool = (
+        False  # If True, freeze weights and only learn the embeddings
+    )
+
+
+@dataclass
+class TrainState:
+    model: nn.Module
+    optimizers: Sequence[torch.optim.Optimizer]
+    optimizer_lrs: Sequence[float]
+    model_state: Any
+
+    training_step: int
+    total_steps: int
+
+
+def create_dataloader(
+    config, split: str, rank: int, world_size: int, **kwargs
+):
+    dataset = PuzzleDataset(
+        PuzzleDatasetConfig(
+            seed=config.seed,
+            dataset_paths=(
+                config.data_paths_test
+                if len(config.data_paths_test) > 0 and split == "test"
+                else config.data_paths
+            ),
+            rank=rank,
+            num_replicas=world_size,
+            **kwargs,
+        ),
+        split=split,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=1,
+        prefetch_factor=8,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+    return dataloader, dataset.metadata
+
+
+def create_model(
+    config: PretrainConfig,
+    train_metadata: PuzzleDatasetMetadata,
+    rank: int,
+    world_size: int,
+):
+    model_cfg = dict(
+        **config.arch.__pydantic_extra__,  # type: ignore
+        batch_size=config.global_batch_size // world_size,
+        vocab_size=train_metadata.vocab_size,
+        seq_len=train_metadata.seq_len,
+        num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
+        causal=False,  # Non-autoregressive
+    )
+
+    # Instantiate model with loss head
+    model_cls = load_model_class(config.arch.name)
+    loss_head_cls = load_model_class(config.arch.loss.name)
+
+    with torch.device("cuda"):
+        model: nn.Module = model_cls(model_cfg)
+        # print(model)
+        model = loss_head_cls(model, config.arch.loss.loss_type, config.arch.loss.act_loss_weight)  # type: ignore
+        # print(f"ACT loss weight {config.arch.loss.act_loss_weight}")
+        if "DISABLE_COMPILE" not in os.environ:
+            model = torch.compile(model)  # type: ignore
+
+        # Load checkpoint
+        if rank == 0:
+            load_checkpoint(model, config)
+
+        # Broadcast parameters from rank 0
+        if world_size > 1:
+            with torch.no_grad():
+                for param in list(model.parameters()) + list(model.buffers()):
+                    dist.broadcast(param, src=0)
+
+    # Optimizers and lr
+    if config.arch.puzzle_emb_ndim == 0:
+        optimizers = [
+            AdamAtan2(
+                model.parameters(),
+                lr=0.0001,  # Needs to be set by scheduler
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2),
+            )
+        ]
+        optimizer_lrs = [config.lr]
+    elif config.freeze_weights:
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0.0001,  # Needs to be set by scheduler
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size,
+            )
+        ]
+        optimizer_lrs = [config.puzzle_emb_lr]
+    else:
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0.0001,  # Needs to be set by scheduler
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size,
+            ),
+            AdamAtan2(
+                model.parameters(),
+                lr=0.0001,  # Needs to be set by scheduler
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2),
+            ),
+        ]
+        optimizer_lrs = [config.puzzle_emb_lr, config.lr]
+
+    return model, optimizers, optimizer_lrs
+
+
+def mix_weights_direct(device, alpha, net, nets):
+    """
+    Get weighted combination of the models in nets. Weights given by alpha. Returns net with merged weights.
+    """
+    sd = []
+    for i in range(len(nets)):
+        sd += [nets[i].state_dict()]
+    sd_alpha = {}
+    for k in sd[0].keys():
+        comb_net = alpha[0] * sd[0][k].to(device)
+        for i in range(1, len(nets)):
+            comb_net += alpha[i] * sd[i][k].to(device)
+        sd_alpha[k] = comb_net
+    net.load_state_dict(sd_alpha)
+    return net
+
+
+def cosine_schedule_with_warmup_lr_lambda(
+    current_step: int,
+    *,
+    base_lr: float,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_ratio: float = 0.0,
+    num_cycles: float = 0.5,
+):
+    if current_step < num_warmup_steps:
+        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
+
+    progress = float(current_step - num_warmup_steps) / float(
+        max(1, num_training_steps - num_warmup_steps)
+    )
+    return base_lr * (
+        min_ratio
+        + max(
+            0.0,
+            (1 - min_ratio)
+            * 0.5
+            * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
+        )
+    )
+
+
+def init_train_state(
+    config: PretrainConfig,
+    train_metadata: PuzzleDatasetMetadata,
+    rank: int,
+    world_size: int,
+):
+    # Estimated total training steps
+    total_steps = int(
+        config.epochs
+        * train_metadata.total_groups
+        * train_metadata.mean_puzzle_examples
+        / config.global_batch_size
+    )
+
+    # Model
+    model, optimizers, optimizer_lrs = create_model(
+        config, train_metadata, rank=rank, world_size=world_size
+    )
+
+    return TrainState(
+        training_step=0,
+        total_steps=total_steps,
+        model=model,
+        optimizers=optimizers,
+        optimizer_lrs=optimizer_lrs,
+        model_state=None,
+    )
+
+
+def save_train_state(config: PretrainConfig, train_state: TrainState):
+    # FIXME: Only saved model.
+    if config.checkpoint_path is None:
+        return
+
+    os.makedirs(config.checkpoint_path, exist_ok=True)
+    torch.save(
+        train_state.model.state_dict(),
+        os.path.join(config.checkpoint_path, f"step_{train_state.training_step}"),
+    )
+
+
+def load_checkpoint(model: nn.Module, config: PretrainConfig):
+    if config.load_checkpoint is not None:
+
+        # Load state dict
+        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+
+        # Resize and reset puzzle emb if needed
+        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
+        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+        if puzzle_emb_name in state_dict:
+            puzzle_emb = state_dict[puzzle_emb_name]
+            if puzzle_emb.shape != expected_shape:
+                print(
+                    f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}"
+                )
+                # Re-initialize using mean
+                state_dict[puzzle_emb_name] = (
+                    torch.mean(puzzle_emb, dim=0, keepdim=True)
+                    .expand(expected_shape)
+                    .contiguous()
+                )
+        model.load_state_dict(state_dict, assign=True)
+
+
+def compute_lr(base_lr: float, config, train_state: TrainState):
+    return cosine_schedule_with_warmup_lr_lambda(
+        current_step=train_state.training_step,
+        base_lr=base_lr,
+        num_warmup_steps=round(config.lr_warmup_steps),
+        num_training_steps=train_state.total_steps,
+        min_ratio=config.lr_min_ratio,
+    )
+
+
+def create_evaluators(
+    config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata
+) -> List[Any]:
+    data_paths = (
+        config.data_paths_test if len(config.data_paths_test) > 0 else config.data_paths
+    )
+    # Initialize evaluators
+    evaluators = []
+    for cfg in config.evaluators:
+        for data_path in data_paths:
+            cls = load_model_class(cfg.name, "evaluators.")(
+                data_path=data_path,
+                eval_metadata=eval_metadata,
+                **cfg.__pydantic_extra__,
+            )  # type: ignore
+            evaluators.append(cls)
+
+    return evaluators
+
+
+def train_batch(
+    config: PretrainConfig,
+    train_state: TrainState,
+    batch: Any,
+    global_batch_size: int,
+    rank: int,
+    world_size: int,
+):
+    train_state.training_step += 1
+    if train_state.training_step > train_state.total_steps:  # At most train_total_steps
+        return
+
+    batch = {k: v.cuda() for k, v in batch.items()}
+
+    if train_state.model_state is None:
+        with torch.device("cuda"):
+            train_state.model_state = train_state.model.model.initial_state_train(batch)  # type: ignore
+
+    train_state.model_state, loss, metrics, _, _ = train_state.model(
+        state=train_state.model_state, batch=batch, return_keys=[]
+    )
+
+    ((1 / global_batch_size) * loss).backward()
+
+    # Allreduce
+    if world_size > 1:
+        for param in train_state.model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad)
+
+    # Apply optimizer
+    lr_this_step = None
+    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+        lr_this_step = compute_lr(base_lr, config, train_state)
+
+        for param_group in optim.param_groups:
+            param_group["lr"] = lr_this_step
+
+        optim.step()
+        optim.zero_grad()
+
+    # Reduce metrics
+    if len(metrics):
+        assert not any(v.requires_grad for v in metrics.values())
+
+        metric_keys = list(
+            sorted(metrics.keys())
+        )  # Sort keys to guarantee all processes use the same order.
+        # Reduce and reconstruct
+        metric_values = torch.stack([metrics[k] for k in metric_keys])
+        if world_size > 1:
+            dist.reduce(metric_values, dst=0)
+
+        if rank == 0:
+            metric_values = metric_values.cpu().numpy()
+            reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
+
+            # Postprocess
+            count = max(reduced_metrics["count"], 1)  # Avoid NaNs
+            reduced_metrics = {
+                f"train/{k}": v / (global_batch_size if k.endswith("loss") else count)
+                for k, v in reduced_metrics.items()
+            }
+
+            reduced_metrics["train/lr"] = lr_this_step
+            return reduced_metrics
+
+
+def evaluate(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+    eval_metadata: PuzzleDatasetMetadata,
+    evaluators: List[Any],
+    rank: int,
+    world_size: int,
+    cpu_group: Optional[dist.ProcessGroup],
+    subset_sampling_seed: int,
+    use_subset_of_data: bool = True,
+):
+    reduced_metrics = None
+
+    if rank == 0:
+        eval_start_time = datetime.datetime.now()
+
+    # we might not want to do eval with the entire test dataset every time
+    if use_subset_of_data:
+        data_subset_batch_indices = sample_dataset_batch_indices(
+            len(eval_loader),
+            rank,
+            world_size,
+            subset_sampling_seed,
+            config.eval_dataset_fraction,
+            config.eval_max_batches,
+        )
+    else:
+        data_subset_batch_indices = None
+
+    with torch.inference_mode():
+        return_keys = set(config.eval_save_outputs) # Empty
+        return_keys.add("logits")
+        return_keys.add("q_halt_logits")
+
+        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)} # 'all': 0
+
+        save_outputs = {}
+        metric_keys = []
+        metric_values = None
+
+        processed_batches = 0
+
+        for batch_idx, (set_name, batch, global_batch_size) in enumerate(eval_loader):
+            if (
+                data_subset_batch_indices is not None
+                and batch_idx not in data_subset_batch_indices
+            ):
+                continue
+
+            processed_batches += 1
+            if rank == 0:
+                print(f"Processing batch {processed_batches}: {set_name}")
+
+            # inputs: (B, seq_len), labels: (B, seq_len), puzzle_identifiers: (B)
+            batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device("cuda"):
+                state = train_state.model.model.initial_state_eval(batch)
+            
+            # Forward
+            outputs = None
+            for inference_step in range(config.arch.halt_max_steps):
+                state, loss, metrics, outputs, all_finish = train_state.model(
+                    state=state, batch=batch, prev_outputs=outputs, return_keys=return_keys
+                )
+                if all_finish:
+                    if rank == 0:
+                        print(f"  Completed inference in {inference_step + 1} steps")
+                        break
+
+            for collection in (batch, outputs):
+                for k, v in collection.items():
+                    if k in config.eval_save_outputs:
+                        save_outputs.setdefault(k, [])
+                        save_outputs[k].append(v.cpu())  # Move to CPU for saving GPU memory
+
+            del state, loss, outputs, batch, all_finish
+
+            # Aggregate metrics
+            set_id = set_ids[set_name]
+
+            if metric_values is None:
+                metric_keys = list(
+                    sorted(metrics.keys())
+                )  # Sort keys to guarantee all processes use the same order.
+                metric_values = torch.zeros(
+                    (len(set_ids), len(metrics.values())),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+
+            metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
+
+            del metrics
+
+        # concatenate save preds
+        save_outputs = {k: torch.cat(v, dim=0) for k, v in save_outputs.items()}
+
+        # Save preds
+        if config.checkpoint_path is not None and len(save_outputs):
+            # Each rank save predictions independently
+            os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
+            torch.save(
+                save_outputs,
+                os.path.join(
+                    config.checkpoint_path, f"step_{train_state.training_step}_all_preds.{rank}"
+                ),
+            )
+
+        del save_outputs
+
+        # Reduce to rank 0
+        if metric_values is not None:
+            if world_size > 1:
+                dist.reduce(metric_values, dst=0)
+
+            if rank == 0:
+                reduced_metrics = metric_values.cpu().numpy()
+                reduced_metrics = {
+                    set_name: {
+                        metric_name: reduced_metrics[set_id, metric_id]
+                        for metric_id, metric_name in enumerate(metric_keys)
+                    }
+                    for set_id, set_name in enumerate(set_ids)
+                }
+
+                # Postprocess
+                for set_name, m in reduced_metrics.items():
+                    count = max(m.pop("count"), 1)  # Avoid NaNs
+                    reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
+
+    return reduced_metrics
+
+
+def eval_log_and_checkpoint(
+    RANK: int,
+    WORLD_SIZE: int,
+    CPU_PROCESS_GROUP,
+    config: PretrainConfig,
+    train_state: TrainState,
+    ema_helper: EMAHelper,
+    eval_loader: torch.utils.data.DataLoader,
+    eval_metadata: PuzzleDatasetMetadata,
+    evaluators: List[Any],
+    checkpoint: bool,
+    use_subset_of_data: bool = False,
+):
+    if RANK == 0:
+        print("EVALUATE")
+    if config.ema:
+        print("SWITCH TO EMA")
+        train_state_eval = copy.deepcopy(train_state)
+        train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+    else:
+        train_state_eval = train_state
+    train_state_eval.model.eval()
+    metrics = evaluate(
+        config,
+        train_state_eval,
+        eval_loader,
+        eval_metadata,
+        evaluators,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+        cpu_group=CPU_PROCESS_GROUP,
+        subset_sampling_seed=torch.randint(low=0, high=100, size=(1,)).item(),
+        use_subset_of_data=use_subset_of_data,
+    )
+
+    if RANK == 0 and metrics is not None:
+        wandb.log(metrics, step=train_state.training_step)
+
+    if checkpoint and RANK == 0:
+        print("SAVE CHECKPOINT")
+        save_train_state(config, train_state_eval)
+
+    if config.ema:
+        del train_state_eval
+
+def save_code_and_config(config: PretrainConfig):
+    if config.checkpoint_path is None or wandb.run is None:
+        return
+
+    os.makedirs(config.checkpoint_path, exist_ok=True)
+
+    # Copy code
+    code_list = [
+        get_model_source_path(config.arch.name),
+        get_model_source_path(config.arch.loss.name),
+    ]
+    for code_file in code_list:
+        if code_file is not None:
+            code_name = os.path.basename(code_file)
+
+            shutil.copy(code_file, os.path.join(config.checkpoint_path, code_name))
+
+    # Dump config as yaml
+    config_file = os.path.join(config.checkpoint_path, "all_config.yaml")
+    with open(config_file, "wt") as f:
+        yaml.dump(config.model_dump(), f)
+
+    # Log code
+    wandb.run.log_code(config.checkpoint_path)
+
+
+def load_synced_config(
+    hydra_config: DictConfig, rank: int, world_size: int
+) -> PretrainConfig:
+    objects = [None]
+    if rank == 0:
+        config = PretrainConfig(**hydra_config)  # type: ignore
+
+        # Naming
+        if config.project_name is None:
+            config.project_name = (
+                f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-torch"
+            )
+        if config.run_name is None:
+            config.run_name = (
+                f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
+            )
+        if config.checkpoint_path is None:
+            config.checkpoint_path = os.path.join(
+                "checkpoints", config.project_name, config.run_name
+            )
+
+        objects = [config]
+
+    if world_size > 1:
+        dist.broadcast_object_list(objects, src=0)
+
+    return objects[0]  # type: ignore
+
+
+@hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
+def launch(hydra_config: DictConfig):
+    RANK = 0
+    WORLD_SIZE = 1
+    CPU_PROCESS_GROUP = None
+
+    # Initialize distributed training if in distributed environment (e.g. torchrun)
+    if "LOCAL_RANK" in os.environ:
+        # Initialize distributed, default device and dtype
+        dist.init_process_group(backend="nccl")
+
+        RANK = dist.get_rank()
+        WORLD_SIZE = dist.get_world_size()
+
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+        # CPU GLOO process group
+        CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
+        assert (
+            dist.get_rank(CPU_PROCESS_GROUP) == RANK
+            and dist.get_world_size(CPU_PROCESS_GROUP) == WORLD_SIZE
+        )
+
+    # Load sync'ed config
+    config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
+
+    # Seed RNGs to ensure consistency
+    torch.random.manual_seed(config.seed + RANK)
+
+    # Dataset
+    train_epochs_per_iter = (
+        config.eval_interval if config.eval_interval is not None else config.epochs
+    )
+    total_iters = config.epochs // train_epochs_per_iter
+
+    assert (
+        config.epochs % train_epochs_per_iter == 0
+    ), "Eval interval must be a divisor of total epochs."
+
+    train_loader, train_metadata = create_dataloader(
+        config,
+        "train",
+        test_set_mode=False,
+        epochs_per_iter=train_epochs_per_iter,
+        global_batch_size=config.global_batch_size,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+    )
+    try:
+        eval_loader, eval_metadata = create_dataloader(
+            config,
+            "test",
+            test_set_mode=True,
+            epochs_per_iter=1,
+            global_batch_size=config.global_batch_size,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
+    except:
+        print("NO EVAL DATA FOUND")
+        eval_loader = eval_metadata = None
+
+    try:
+        evaluators = create_evaluators(config, eval_metadata)
+    except:
+        print("No evaluator found")
+        evaluators = []
+
+    # Train state
+    train_state = init_train_state(
+        config, train_metadata, rank=RANK, world_size=WORLD_SIZE
+    )
+
+    # Progress bar and logger
+    progress_bar = None
+    ema_helper = None
+    if RANK == 0:
+        progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump())  # type: ignore
+        wandb.log(
+            {"num_params": sum(x.numel() for x in train_state.model.parameters())},
+            step=0,
+        )
+        save_code_and_config(config)
+    if config.ema:
+        print("Setup EMA")
+        ema_helper = EMAHelper(mu=config.ema_rate)
+        ema_helper.register(train_state.model)
+
+    # Training Loop
+    for _iter_id in range(total_iters):
+        print(
+            f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}"
+        )
+
+        ############ Train Iter
+        if RANK == 0:
+            print("TRAIN")
+        train_state.model.train()
+        for set_name, batch, global_batch_size in train_loader:
+            metrics = train_batch(
+                config,
+                train_state,
+                batch,
+                global_batch_size,
+                rank=RANK,
+                world_size=WORLD_SIZE,
+            )
+
+            if RANK == 0 and metrics is not None:
+                wandb.log(metrics, step=train_state.training_step)
+                progress_bar.update(train_state.training_step - progress_bar.n)  # type: ignore
+            if config.ema:
+                ema_helper.update(train_state.model)
+
+        if _iter_id >= config.min_eval_interval:
+            ############ Evaluation
+            eval_log_and_checkpoint(
+                RANK,
+                WORLD_SIZE,
+                CPU_PROCESS_GROUP,
+                config,
+                train_state,
+                ema_helper,
+                eval_loader,
+                eval_metadata,
+                evaluators,
+                config.checkpoint_every_eval or (_iter_id == total_iters - 1),
+                True,
+            )
+
+    # final evaluation with full test dataset
+    print("FINAL EVALUATION WITH FULL TEST DATASET")
+    eval_log_and_checkpoint(
+        RANK,
+        WORLD_SIZE,
+        CPU_PROCESS_GROUP,
+        config,
+        train_state,
+        ema_helper,
+        eval_loader,
+        eval_metadata,
+        evaluators,
+        True,
+        False,
+    )
+
+    # finalize
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    launch()
+```
+
+File: puzzle_dataset.py
+==================================================
+```python
+import os
+import json
+from typing import Tuple, List, Dict, Optional
+import numpy as np
+import pydantic
+
+import torch
+from torch.utils.data import IterableDataset, get_worker_info
+
+from models.losses import IGNORE_LABEL_ID
+from dataset.common import PuzzleDatasetMetadata
+
+from argdantic import ArgParser
+from pydantic import BaseModel
+
+from tqdm import tqdm
+
+def _sample_batch(
+    rng: np.random.Generator,
+    group_order: np.ndarray,
+    puzzle_indices: np.ndarray,
+    group_indices: np.ndarray,
+    start_index: int,
+    global_batch_size: int,
+):
+    # Pack examples into a full batch
+    batch = []
+    batch_puzzle_indices = []
+    current_size = 0
+
+    while (start_index < group_order.size) and (current_size < global_batch_size):
+        # Pick a group and a puzzle from that group
+        group_id = group_order[start_index]
+        puzzle_id = rng.integers(group_indices[group_id], group_indices[group_id + 1])
+        start_index += 1
+
+        # Get range of the puzzle
+        puzzle_start = puzzle_indices[puzzle_id]
+        puzzle_size = int(puzzle_indices[puzzle_id + 1] - puzzle_start)
+
+        append_size = min(puzzle_size, global_batch_size - current_size)
+
+        # Put into batch
+        # NOTE: should this be rng.choice for reproducible multi-GPU training?
+        batch_puzzle_indices.append(np.full(append_size, puzzle_id, dtype=np.int32))
+        batch.append(
+            puzzle_start + np.random.choice(puzzle_size, append_size, replace=False)
+        )
+
+        current_size += append_size
+
+    return start_index, np.concatenate(batch), np.concatenate(batch_puzzle_indices)
+
+
+class PuzzleDatasetConfig(pydantic.BaseModel):
+    seed: int
+    dataset_paths: List[str]
+    global_batch_size: int
+    test_set_mode: bool
+    epochs_per_iter: int  # Batch X epochs in an iteration to reduce overhead.
+    rank: int
+    num_replicas: int
+
+
+class PuzzleDataset(IterableDataset):
+    def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
+        super().__init__()
+        self.config = config
+        self.split = split
+
+        # Merge multiple metadata
+        prev_seq_len = None
+        prev_vocab_size = None
+        prev_pad_id = None
+        prev_ignore_label_id = None
+        prev_blank_identifier_id = None
+        prev_sets = None
+        prev_num_identifiers = None
+        mean_puzzle_examples = 0
+        total_puzzles = 0
+        total_groups = 0
+        num_identifiers = 0
+        for dataset_path in config.dataset_paths:
+            current_metadata = self._load_metadata(dataset_path)
+            if prev_seq_len is None:
+                prev_seq_len = current_metadata.seq_len
+                prev_vocab_size = current_metadata.vocab_size
+                prev_pad_id = current_metadata.pad_id
+                prev_ignore_label_id = current_metadata.ignore_label_id
+                prev_blank_identifier_id = current_metadata.blank_identifier_id
+                prev_sets = current_metadata.sets
+                prev_num_identifiers = current_metadata.num_puzzle_identifiers
+            else:
+                assert prev_seq_len == current_metadata.seq_len
+                assert prev_vocab_size == current_metadata.vocab_size
+                assert prev_pad_id == current_metadata.pad_id
+                assert prev_ignore_label_id == current_metadata.ignore_label_id
+                assert prev_blank_identifier_id == current_metadata.blank_identifier_id
+                assert prev_sets == current_metadata.sets
+                assert prev_num_identifiers == current_metadata.num_puzzle_identifiers
+            mean_puzzle_examples += (
+                current_metadata.mean_puzzle_examples * current_metadata.total_puzzles
+            )
+            total_puzzles += current_metadata.total_puzzles
+            total_groups += current_metadata.total_groups
+            num_identifiers += current_metadata.num_puzzle_identifiers
+        mean_puzzle_examples = mean_puzzle_examples / total_puzzles
+
+        self.metadata = PuzzleDatasetMetadata(
+            seq_len=prev_seq_len,
+            vocab_size=prev_vocab_size,
+            pad_id=prev_pad_id,
+            ignore_label_id=prev_ignore_label_id,
+            blank_identifier_id=prev_blank_identifier_id,
+            num_puzzle_identifiers=num_identifiers,
+            total_groups=total_groups,
+            mean_puzzle_examples=mean_puzzle_examples,
+            total_puzzles=total_puzzles,
+            sets=prev_sets,
+        )
+
+        # Checks
+        assert (
+            self.config.global_batch_size % self.config.num_replicas == 0
+        ), f"Global batch size {self.config.global_batch_size} must be multiples of nodes {self.config.num_replicas}."
+        self.local_batch_size = (
+            self.config.global_batch_size // self.config.num_replicas
+        )
+
+        # State
+        self._data = None
+        self._iters = 0
+
+        # Length
+        self.num_batches = 0
+        for set_name in self.metadata.sets:
+            for i, dataset_path in tqdm(enumerate(self.config.dataset_paths)):
+                inputs = np.load(
+                    os.path.join(dataset_path, self.split, f"{set_name}__inputs.npy"),
+                    mmap_mode="r",
+                )
+                self.num_batches += (
+                    len(inputs) + self.config.global_batch_size - 1
+                ) // self.config.global_batch_size
+
+    def __len__(self):
+        return self.num_batches
+
+    def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
+        with open(os.path.join(dataset_path, self.split, "dataset.json"), "r") as f:
+            return PuzzleDatasetMetadata(**json.load(f))
+
+    def _lazy_load_dataset(self):
+        if self._data is not None:
+            return
+
+        field_mmap_modes = {
+            "inputs": "r",
+            "labels": "r",
+            # Keep indices in memory
+            "puzzle_identifiers": None,
+            "puzzle_indices": None,
+            "group_indices": None,
+        }
+
+        # Load data
+        self._data = {}
+        for set_name in self.metadata.sets:  # Load subset
+            for i, dataset_path in enumerate(self.config.dataset_paths):
+                if i > 0:
+                    set_name_ = set_name + str(i)
+                else:
+                    set_name_ = set_name
+                self._data[set_name_] = {
+                    field_name: np.load(
+                        os.path.join(
+                            dataset_path, self.split, f"{set_name}__{field_name}.npy"
+                        ),
+                        mmap_mode=mmap_mode,
+                    )
+                    for field_name, mmap_mode in field_mmap_modes.items()
+                }
+
+    def _collate_batch(self, batch):
+        # Convert dtype
+        batch = {k: v.astype(np.int32) for k, v in batch.items()}
+
+        # Convert ignore label IDs
+        if self.metadata.ignore_label_id is not None:
+            batch["labels"][
+                batch["labels"] == self.metadata.ignore_label_id
+            ] = IGNORE_LABEL_ID
+
+        # Pad
+        if batch["puzzle_identifiers"].size < self.local_batch_size:
+            pad_size = self.local_batch_size - batch["puzzle_identifiers"].size
+            pad_values = {
+                "inputs": self.metadata.pad_id,
+                "labels": IGNORE_LABEL_ID,
+                "puzzle_identifiers": self.metadata.blank_identifier_id,
+            }
+            batch = {
+                k: np.pad(
+                    v,
+                    ((0, pad_size),) + ((0, 0),) * (v.ndim - 1),
+                    constant_values=pad_values[k],
+                )
+                for k, v in batch.items()
+            }
+
+        # To tensor
+        return {k: torch.from_numpy(v) for k, v in batch.items()}
+
+    def _iter_test(self):
+        for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
+            total_examples = len(dataset["inputs"])
+
+            # Load examples one by one
+            start_index = 0
+            while start_index < total_examples:
+                # Compute indices
+                end_index = min(
+                    total_examples, start_index + self.config.global_batch_size
+                )
+
+                local_start = start_index + self.config.rank * self.local_batch_size
+                local_end = min(
+                    start_index + (self.config.rank + 1) * self.local_batch_size,
+                    end_index,
+                )
+
+                # Get batch of examples, and also puzzle IDs
+                puzzle_indices = []
+                puzzle_index = (
+                    np.searchsorted(
+                        dataset["puzzle_indices"], local_start, side="right"
+                    )
+                    - 1
+                )
+                for i in range(local_start, local_end):
+                    while (
+                        puzzle_index + 1 < len(dataset["puzzle_indices"])
+                        and i >= dataset["puzzle_indices"][puzzle_index + 1]
+                    ):
+                        puzzle_index += 1
+
+                    puzzle_indices.append(puzzle_index)
+
+                batch = self._collate_batch(
+                    {
+                        "inputs": dataset["inputs"][local_start:local_end],
+                        "labels": dataset["labels"][local_start:local_end],
+                        "puzzle_identifiers": dataset["puzzle_identifiers"][
+                            puzzle_indices
+                        ],
+                    }
+                )
+
+                yield set_name, batch, end_index - start_index
+
+                # Advance to next batch
+                start_index += self.config.global_batch_size
+
+    def _iter_train(self):
+        for set_name, dataset in self._data.items():  # type: ignore
+            # Increase epoch count
+            self._iters += 1
+
+            # Randomly shuffle groups
+            rng = np.random.Generator(
+                np.random.Philox(seed=self.config.seed + self._iters)
+            )
+
+            group_order = np.concatenate(
+                [
+                    rng.permutation(dataset["group_indices"].size - 1)
+                    for _i in range(self.config.epochs_per_iter)
+                ]
+            )
+            start_index = 0
+
+            while start_index < group_order.size:
+                start_index, batch_indices, batch_puzzle_indices = _sample_batch(
+                    rng,
+                    group_order=group_order,
+                    puzzle_indices=dataset["puzzle_indices"],
+                    group_indices=dataset["group_indices"],
+                    start_index=start_index,
+                    global_batch_size=self.config.global_batch_size,
+                )
+
+                # Select current rank and collate
+                global_effective_batch_size = (
+                    batch_puzzle_indices.size
+                )  # Global effective batch size, excluding pads
+
+                # Drop last batch
+                if global_effective_batch_size < self.config.global_batch_size:
+                    break
+
+                batch_indices = batch_indices[
+                    self.config.rank
+                    * self.local_batch_size : (self.config.rank + 1)
+                    * self.local_batch_size
+                ]
+                batch_puzzle_indices = batch_puzzle_indices[
+                    self.config.rank
+                    * self.local_batch_size : (self.config.rank + 1)
+                    * self.local_batch_size
+                ]
+                batch = self._collate_batch(
+                    {
+                        "inputs": dataset["inputs"][batch_indices],
+                        "labels": dataset["labels"][batch_indices],
+                        "puzzle_identifiers": dataset["puzzle_identifiers"][
+                            batch_puzzle_indices
+                        ],
+                    }
+                )
+
+                yield set_name, batch, global_effective_batch_size
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        assert (
+            worker_info is None or worker_info.num_workers == 1
+        ), "Multithreaded data loading is not currently supported."
+
+        self._lazy_load_dataset()
+
+        # Iterate using specified mode
+        if self.config.test_set_mode:
+            yield from self._iter_test()
+        else:
+            yield from self._iter_train()
+```
+
+File: dataset/build_sudoku_dataset.py
+==================================================
+```python
+from typing import Optional
+import os
+import csv
+import json
+import numpy as np
+
+from argdantic import ArgParser
+from pydantic import BaseModel
+from tqdm import tqdm
+from huggingface_hub import hf_hub_download
+
+from common import PuzzleDatasetMetadata
+
+
+cli = ArgParser()
+
+
+class DataProcessConfig(BaseModel):
+    source_repo: str = "sapientinc/sudoku-extreme"
+    output_dir: str = "data/sudoku-extreme-full"
+
+    subsample_size: Optional[int] = None
+    min_difficulty: Optional[int] = None
+    num_aug: int = 0
+
+
+def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
+    # Create a random digit mapping: a permutation of 1..9, with zero (blank) unchanged
+    digit_map = np.pad(np.random.permutation(np.arange(1, 10)), (1, 0))
+    
+    # Randomly decide whether to transpose.
+    transpose_flag = np.random.rand() < 0.5
+
+    # Generate a valid row permutation:
+    # - Shuffle the 3 bands (each band = 3 rows) and for each band, shuffle its 3 rows.
+    bands = np.random.permutation(3)
+    row_perm = np.concatenate([b * 3 + np.random.permutation(3) for b in bands])
+
+    # Similarly for columns (stacks).
+    stacks = np.random.permutation(3)
+    col_perm = np.concatenate([s * 3 + np.random.permutation(3) for s in stacks])
+
+    # Build an 81->81 mapping. For each new cell at (i, j)
+    # (row index = i // 9, col index = i % 9),
+    # its value comes from old row = row_perm[i//9] and old col = col_perm[i%9].
+    mapping = np.array([row_perm[i // 9] * 9 + col_perm[i % 9] for i in range(81)])
+
+    def apply_transformation(x: np.ndarray) -> np.ndarray:
+        # Apply transpose flag
+        if transpose_flag:
+            x = x.T
+        # Apply the position mapping.
+        new_board = x.flatten()[mapping].reshape(9, 9).copy()
+        # Apply digit mapping
+        return digit_map[new_board]
+
+    return apply_transformation(board), apply_transformation(solution)
+
+
+def convert_subset(set_name: str, config: DataProcessConfig):
+    # Read CSV
+    inputs = []
+    labels = []
+    
+    with open(hf_hub_download(config.source_repo, f"{set_name}.csv", repo_type="dataset"), newline="") as csvfile:
+        reader = csv.reader(csvfile)
+        next(reader)  # Skip header
+        for source, q, a, rating in reader:
+            if (config.min_difficulty is None) or (int(rating) >= config.min_difficulty):
+                assert len(q) == 81 and len(a) == 81
+                
+                inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+                labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+
+    # If subsample_size is specified for the training set,
+    # randomly sample the desired number of examples.
+    if set_name == "train" and config.subsample_size is not None:
+        total_samples = len(inputs)
+        if config.subsample_size < total_samples:
+            indices = np.random.choice(total_samples, size=config.subsample_size, replace=False)
+            inputs = [inputs[i] for i in indices]
+            labels = [labels[i] for i in indices]
+
+    # Generate dataset
+    num_augments = config.num_aug if set_name == "train" else 0
+
+    results = {k: [] for k in ["inputs", "labels", "puzzle_identifiers", "puzzle_indices", "group_indices"]}
+    puzzle_id = 0
+    example_id = 0
+    
+    results["puzzle_indices"].append(0)
+    results["group_indices"].append(0)
+    
+    for orig_inp, orig_out in zip(tqdm(inputs), labels):
+        for aug_idx in range(1 + num_augments):
+            # First index is not augmented
+            if aug_idx == 0:
+                inp, out = orig_inp, orig_out
+            else:
+                inp, out = shuffle_sudoku(orig_inp, orig_out)
+
+            # Push puzzle (only single example)
+            results["inputs"].append(inp)
+            results["labels"].append(out)
+            example_id += 1
+            puzzle_id += 1
+            
+            results["puzzle_indices"].append(example_id)
+            results["puzzle_identifiers"].append(0)
+            
+        # Push group
+        results["group_indices"].append(puzzle_id)
+        
+    # To Numpy
+    def _seq_to_numpy(seq):
+        arr = np.concatenate(seq).reshape(len(seq), -1)
+        
+        assert np.all((arr >= 0) & (arr <= 9))
+        return arr + 1
+    
+    results = {
+        "inputs": _seq_to_numpy(results["inputs"]),
+        "labels": _seq_to_numpy(results["labels"]),
+        
+        "group_indices": np.array(results["group_indices"], dtype=np.int32),
+        "puzzle_indices": np.array(results["puzzle_indices"], dtype=np.int32),
+        "puzzle_identifiers": np.array(results["puzzle_identifiers"], dtype=np.int32),
+    }
+
+    # Metadata
+    metadata = PuzzleDatasetMetadata(
+        seq_len=81,
+        vocab_size=10 + 1,  # PAD + "0" ... "9"
+        pad_id=0,
+        ignore_label_id=0,
+        blank_identifier_id=0,
+        num_puzzle_identifiers=1,
+        total_groups=len(results["group_indices"]) - 1,
+        mean_puzzle_examples=1,
+        total_puzzles=len(results["group_indices"]) - 1,
+        sets=["all"]
+    )
+
+    # Save metadata as JSON.
+    save_dir = os.path.join(config.output_dir, set_name)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    with open(os.path.join(save_dir, "dataset.json"), "w") as f:
+        json.dump(metadata.model_dump(), f)
+        
+    # Save data
+    for k, v in results.items():
+        np.save(os.path.join(save_dir, f"all__{k}.npy"), v)
+        
+    # Save IDs mapping (for visualization only)
+    with open(os.path.join(config.output_dir, "identifiers.json"), "w") as f:
+        json.dump(["<blank>"], f)
+
+
+@cli.command(singleton=True)
+def preprocess_data(config: DataProcessConfig):
+    convert_subset("train", config)
+    convert_subset("test", config)
+
+
+if __name__ == "__main__":
+    cli()
+```
+
+File: train_rloo.py
+==================================================
+```python
+import datetime
+from typing import Optional, Any, Sequence, List, Dict
+from dataclasses import dataclass
+import os
+import math
+import copy
+
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch import nn
+import torch.utils.checkpoint as checkpoint
+import tqdm
+import wandb
+import hydra
+import pydantic
+from omegaconf import DictConfig
+from adam_atan2_pytorch import AdamAtan2
+from einops import repeat
+
+from puzzle_dataset import PuzzleDatasetMetadata
+from utils.functions import load_model_class, sample_dataset_batch_indices
+from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from pretrain import create_dataloader, load_checkpoint, save_train_state, save_code_and_config
+
+from rloo import run_forward_step
+
+
+class LossConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    name: str
+
+
+class ArchConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    name: str
+    loss: LossConfig
+    halt_max_steps: int = 16
+    H_cycles: int = 3
+
+
+class RLOOParams(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    epsilon: float = 0.2
+    reward_type: str = "cell_match"
+    entropy_coef: float
+
+
+class RLOOConfig(pydantic.BaseModel):
+    arch: ArchConfig
+    rloo: RLOOParams
+    data_paths: List[str]
+    data_paths_test: List[str] = []
+
+    global_batch_size: int
+    num_rollouts_per_input: int = 8
+    training_steps: int
+
+    lr: float
+    lr_min_ratio: float
+    lr_warmup_steps: int
+
+    beta1: float
+    beta2: float
+    weight_decay: float
+
+    puzzle_emb_lr: float
+    puzzle_emb_weight_decay: float
+
+    seed: int = 0
+    use_kl: bool = False
+
+    project_name: Optional[str] = None
+    run_name: Optional[str] = None
+    load_checkpoint: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+
+    # Eval params
+    evaluators: List[Any] = []
+    eval_interval: int = 100
+    eval_max_batches: Optional[int] = None
+    eval_dataset_fraction: Optional[float] = None
+    eval_save_outputs: List[str] = []
+    checkpoint_every_eval: bool = False
+    eval_batch_size: int
+
+    ema: bool = False
+    ema_rate: float = 0.999
+    freeze_weights: bool = False
+
+
+@dataclass
+class TrainState:
+    model: nn.Module
+    optimizers: Sequence[torch.optim.Optimizer]
+    optimizer_lrs: Sequence[float]
+    model_state: Any
+    training_step: int
+    total_steps: int
+
+# --- Model Creation ---
+
+
+def create_model(config: RLOOConfig, train_metadata: PuzzleDatasetMetadata):
+    # Calculate the actual batch size the model will see (Batch * Rollouts)
+    expanded_batch_size = config.global_batch_size * config.num_rollouts_per_input
+    print(f"Batch size {config.global_batch_size} * num rollouts {config.num_rollouts_per_input} = expanded batch size {expanded_batch_size}")
+    model_cfg = dict(
+        **config.arch.model_dump(exclude={'loss'}),
+        batch_size=expanded_batch_size,
+        vocab_size=train_metadata.vocab_size,
+        seq_len=train_metadata.seq_len,
+        num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
+        causal=False,
+    )
+
+    model_cls = load_model_class(config.arch.name)
+    loss_head_cls = load_model_class(config.arch.loss.name)
+
+    with torch.device("cuda"):
+        model: nn.Module = model_cls(model_cfg)
+        model = loss_head_cls(model, config.arch.loss.loss_type,
+                              config.arch.loss.act_loss_weight)
+        if "DISABLE_COMPILE" not in os.environ:
+            model = torch.compile(model)
+        load_checkpoint(model, config)
+
+    if config.arch.model_dump().get("puzzle_emb_ndim", 0) == 0:
+        optimizers = [AdamAtan2(model.parameters(
+        ), lr=config.lr, weight_decay=config.weight_decay, betas=(config.beta1, config.beta2))]
+        optimizer_lrs = [config.lr]
+    else:
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(), lr=config.puzzle_emb_lr, weight_decay=config.puzzle_emb_weight_decay, world_size=1
+            ),
+            AdamAtan2(
+                model.parameters(), lr=config.lr, weight_decay=config.weight_decay, betas=(config.beta1, config.beta2)
+            ),
+        ]
+        optimizer_lrs = [config.puzzle_emb_lr, config.lr]
+
+    return model, optimizers, optimizer_lrs
+
+
+def compute_lr(base_lr: float, config: RLOOConfig, train_state: TrainState):
+    current_step = train_state.training_step
+    num_warmup_steps = config.lr_warmup_steps
+    num_training_steps = config.training_steps
+    min_ratio = config.lr_min_ratio
+
+    if current_step < num_warmup_steps:
+        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
+    progress = float(current_step - num_warmup_steps) / \
+        float(max(1, num_training_steps - num_warmup_steps))
+    return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * 0.5 * 2.0 * progress))))
+
+# --- Evaluation Logic (Ported from pretrain.py) ---
+
+def evaluate(
+    config: RLOOConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+    eval_metadata: PuzzleDatasetMetadata,
+    rank: int,
+    world_size: int,
+    subset_sampling_seed: int,
+    use_subset_of_data: bool = True,
+):
+    reduced_metrics = None
+
+    if rank == 0:
+        print(f"Starting Evaluation at step {train_state.training_step}...")
+
+    # we might not want to do eval with the entire test dataset every time
+    if use_subset_of_data:
+        data_subset_batch_indices = sample_dataset_batch_indices(
+            len(eval_loader),
+            rank,
+            world_size,
+            subset_sampling_seed,
+            config.eval_dataset_fraction,
+            config.eval_max_batches,
+        )
+    else:
+        data_subset_batch_indices = None
+
+    with torch.inference_mode():
+        return_keys = set(config.eval_save_outputs) # Empty
+        return_keys.add("logits")
+        return_keys.add("q_halt_logits")
+
+        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)} # 'all': 0
+
+        save_outputs = {}
+        metric_keys = []
+        metric_values = None
+
+        processed_batches = 0
+
+        for batch_idx, (set_name, batch, _) in enumerate(eval_loader):
+            if (
+                data_subset_batch_indices is not None
+                and batch_idx not in data_subset_batch_indices
+            ):
+                continue
+
+            processed_batches += 1
+            if rank == 0 and processed_batches % 10 == 0:
+                print(f"Processing eval batch {processed_batches}: {set_name}")
+
+            # inputs: (B, seq_len), labels: (B, seq_len), puzzle_identifiers: (B)
+            batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device("cuda"):
+                state = train_state.model.model.initial_state_eval(batch)
+            
+            # Forward
+            outputs = None
+            for inference_step in range(config.arch.halt_max_steps):
+                state, loss, metrics, outputs, all_finish = train_state.model(
+                    state=state, batch=batch, prev_outputs=outputs, return_keys=return_keys
+                )
+                if all_finish:
+                    break
+
+            for collection in (batch, outputs):
+                for k, v in collection.items():
+                    if k in config.eval_save_outputs:
+                        save_outputs.setdefault(k, [])
+                        save_outputs[k].append(v.cpu())  # Move to CPU for saving GPU memory
+
+            del state, loss, outputs, batch, all_finish
+
+            # Aggregate metrics
+            set_id = set_ids[set_name]
+
+            if metric_values is None:
+                metric_keys = list(
+                    sorted(metrics.keys())
+                )  # Sort keys to guarantee all processes use the same order.
+                metric_values = torch.zeros(
+                    (len(set_ids), len(metrics.values())),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+
+            metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
+
+            del metrics
+
+        # concatenate save preds
+        save_outputs = {k: torch.cat(v, dim=0) for k, v in save_outputs.items()}
+
+        # Save preds
+        if config.checkpoint_path is not None and len(save_outputs):
+            # Each rank save predictions independently
+            os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
+            torch.save(
+                save_outputs,
+                os.path.join(
+                    config.checkpoint_path, f"step_{train_state.training_step}_all_preds.{rank}"
+                ),
+            )
+
+        del save_outputs
+
+        # Reduce to rank 0
+        if metric_values is not None:
+            if world_size > 1:
+                dist.reduce(metric_values, dst=0)
+
+            if rank == 0:
+                reduced_metrics = metric_values.cpu().numpy()
+                reduced_metrics = {
+                    set_name: {
+                        metric_name: reduced_metrics[set_id, metric_id]
+                        for metric_id, metric_name in enumerate(metric_keys)
+                    }
+                    for set_id, set_name in enumerate(set_ids)
+                }
+
+                # Postprocess
+                for set_name, m in reduced_metrics.items():
+                    count = max(m.pop("count"), 1)  # Avoid NaNs
+                    reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
+
+    return reduced_metrics
+
+
+def eval_log_and_checkpoint(
+    RANK: int,
+    WORLD_SIZE: int,
+    config: RLOOConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+    eval_metadata: PuzzleDatasetMetadata,
+    checkpoint: bool,
+    use_subset_of_data: bool = False,
+):
+    if RANK == 0:
+        print("EVALUATE")
+    
+    # Switch to eval mode
+    train_state.model.eval()
+    
+    metrics = evaluate(
+        config,
+        train_state,
+        eval_loader,
+        eval_metadata,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+        subset_sampling_seed=torch.randint(low=0, high=100, size=(1,)).item(),
+        use_subset_of_data=use_subset_of_data,
+    )
+
+    if RANK == 0 and metrics is not None:
+        # Flatten metrics for wandb
+        wandb_metrics = {}
+        for set_name, values in metrics.items():
+            for k, v in values.items():
+                wandb_metrics[f"test/{set_name}/{k}"] = v
+        print(wandb_metrics)
+        wandb.log(wandb_metrics, step=train_state.training_step)
+
+    if checkpoint and RANK == 0:
+        print("SAVE CHECKPOINT")
+        save_train_state(config, train_state)
+    
+    # Switch back to train mode
+    train_state.model.train()
+
+
+# --- RLOO Training Logic ---
+
+
+def train_batch_rloo(config: RLOOConfig, train_state: TrainState, batch: Dict[str, Any]):
+    train_state.training_step += 1
+
+    # 1. Setup Batch
+    inputs = batch["inputs"].cuda()
+    pids = batch["puzzle_identifiers"].cuda()
+    gt_labels = batch["labels"].cuda()
+
+    B = inputs.shape[0]
+    G = config.num_rollouts_per_input
+    N = B * G
+
+    # Expand for K rollouts
+    group_inputs = repeat(inputs, 'b ... -> (b g) ...', g=G)
+    group_pids = repeat(pids, 'b ... -> (b g) ...', g=G)
+
+    inner = train_state.model.model.inner
+    H_cycles = inner.config.H_cycles
+    Halt_Max = inner.config.halt_max_steps
+
+    # Lists to store gradients components
+    log_probs_list = []
+    masks_list = []
+
+    all_metrics = {"z_L_entropy": [], "z_L_sigma": [], "z_H_entropy": [], "z_H_sigma": []}
+    halt_logits_list = []
+
+    # 2. Forward Pass (Online Collection)
+    input_embeddings = inner._input_embeddings(group_inputs, group_pids)
+    latents = inner.initial_latents(N)
+    z_L, z_H = latents.z_L, latents.z_H
+    seq_info = dict(cos_sin=inner.rotary_emb()
+                    if hasattr(inner, "rotary_emb") else None)
+
+    active_mask = torch.ones(N, dtype=torch.bool, device="cuda")
+    act_step_num = torch.zeros(N, dtype=torch.long, device="cuda")
+    final_z_H = z_H
+
+    # --- ROLLOUT LOOP ---
+    for step in range(Halt_Max * H_cycles):
+        current_macro_step = min(step // H_cycles, Halt_Max - 1)
+        act_step_num = torch.full((inputs.shape[0] * config.num_rollouts_per_input,),
+                                    current_macro_step,
+                                    dtype=torch.long,
+                                    device="cuda")
+
+        # Step returns log_prob attached to the graph
+        new_z_L, new_z_H, step_log_prob, halt_dist, exploration_metrics, q_logits = checkpoint.checkpoint(
+            run_forward_step,
+            inner,
+            z_L,
+            z_H,
+            input_embeddings,
+            seq_info,
+            act_step_num,
+            use_reentrant=False
+        )
+
+        for k, v in exploration_metrics.items():
+            all_metrics[k].append(v)
+        halt_logits_list.append(q_logits)
+
+        halt_action = halt_dist.sample()
+        halt_log_prob = halt_dist.log_prob(halt_action)
+
+        total_step_log_prob = step_log_prob + halt_log_prob
+
+        # Store valid log probs [N]
+        log_probs_list.append(total_step_log_prob)
+        masks_list.append(active_mask.float())
+
+        # Update State
+        should_halt = (halt_action == 0)
+        active_mask = active_mask & (~should_halt)
+
+        # Update hidden states (Detached for next step input, but new_z graphs still connected for log_prob grads)
+        z_L = new_z_L.detach()
+        z_H = new_z_H.detach()
+
+        final_z_H = torch.where(
+            active_mask[:, None, None], new_z_H, final_z_H)
+
+        
+        if active_mask.sum() == 0:
+            break
+
+    # 3. Reward Calculation
+    lm_logits = inner.lm_head(final_z_H)[:, inner.puzzle_emb_len:, :]
+    preds = torch.argmax(lm_logits, dim=-1)
+
+    group_gts = repeat(gt_labels, 'b l -> (b g) l', g=G)
+    valid_mask = (group_inputs == 1)  # Mask for Sudoku empty cells
+    is_correct = (preds == group_gts) & valid_mask
+    scored_total = valid_mask.sum(dim=1).float().clamp(min=1.0)
+    seq_is_correct = (is_correct.sum(dim=1) == valid_mask.sum(dim=1))
+
+    # Raw Rewards [B*G]
+    scores = is_correct.sum(dim=1).float() / scored_total
+
+    # 4. RLOO Baseline Calculation
+    # Reshape to [B, G]
+    scores_view = scores.view(B, G)
+
+    # Calculate sum of scores for each group
+    sum_scores = scores_view.sum(dim=1, keepdim=True)  # [B, 1]
+
+    # RLOO Baseline: (Sum - current) / (K - 1)
+    rloo_baseline = (sum_scores - scores_view) / (G - 1)
+    advantages = scores_view - rloo_baseline
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages = advantages.view(-1)  # Flatten back to [N]
+
+    # 5. Compute Loss
+    # Loss = - (Advantage * Sum_of_Log_Probs)
+    # We sum log probs over the valid trajectory
+
+    # Stack lists: [Time, N]
+    step_log_probs = torch.stack(log_probs_list, dim=0)
+    step_masks = torch.stack(masks_list, dim=0)
+
+    # Calculate Mean Entropy for Bonus (averaged over time and batch)
+    # We use z_L_entropy and z_H_entropy from the dictionary
+    avg_z_L_entropy = torch.stack(all_metrics["z_L_entropy"]).mean()
+    avg_z_H_entropy = torch.stack(all_metrics["z_H_entropy"]).mean()
+    total_entropy = avg_z_L_entropy + avg_z_H_entropy
+
+    # Multiply by mask
+    masked_log_probs = step_log_probs * step_masks
+    trajectory_log_prob = masked_log_probs.sum(dim=0)
+
+    # Sum over time [N] -> Total trajectory log prob
+    trajectory_log_prob = masked_log_probs.sum(dim=0)
+
+    # Loss = - (RL_Objective + Entropy_Bonus)
+    # We maximize entropy, so we minimize -entropy
+    pg_loss = -(trajectory_log_prob * advantages.detach()).mean()
+    entropy_loss = -config.rloo.entropy_coef * total_entropy
+    loss = pg_loss + entropy_loss
+
+    # Auxiliary metrics
+    # Gather logits for active steps
+    avg_steps = step_masks.sum(dim=0).mean().item()
+
+    # 6. Backward & Opt
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), 1.0)
+    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+        print(f"Skipping step! Gradient is {grad_norm}")
+        for optim in train_state.optimizers:
+            optim.zero_grad()
+        return {"loss": loss.item(), "reward": scores.mean().item(), "lr": 0.0}
+
+    lr_this_step = None
+    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+        lr_this_step = compute_lr(base_lr, config, train_state)
+        for param_group in optim.param_groups:
+            param_group["lr"] = lr_this_step
+        optim.step()
+        optim.zero_grad()
+
+    metrics_to_log = {
+        "loss": loss.item(), 
+        "reward": scores.mean().item(), 
+        "lr": lr_this_step,
+        "metrics/steps": avg_steps,
+        "metrics/z_L_sigma": torch.stack(all_metrics["z_L_sigma"]).mean().item(),
+        "metrics/z_L_entropy": avg_z_L_entropy.item(),
+        "metrics/z_H_sigma": torch.stack(all_metrics["z_H_sigma"]).mean().item(),
+        "metrics/z_H_entropy": avg_z_H_entropy.item(),
+    }
+    
+    print(metrics_to_log)
+    return metrics_to_log
+
+# --- Main Launch ---
+
+
+def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> RLOOConfig:
+    objects = [None]
+    if rank == 0:
+        config = RLOOConfig(**hydra_config)
+        if config.project_name is None:
+            config.project_name = "GTRM-RLOO"
+        if config.checkpoint_path is None:
+            config.checkpoint_path = os.path.join(
+                "checkpoints", config.project_name, config.run_name or "run")
+        objects = [config]
+    if world_size > 1:
+        dist.broadcast_object_list(objects, src=0)
+    return objects[0]
+
+
+@hydra.main(config_path="config", config_name="cfg_rloo", version_base=None)
+def launch(hydra_config: DictConfig):
+
+    RANK = 0
+    WORLD_SIZE = 1
+    CPU_PROCESS_GROUP = None
+
+    if "LOCAL_RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        RANK = dist.get_rank()
+        WORLD_SIZE = dist.get_world_size()
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        
+        # CPU GLOO process group for eval synchronization
+        CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
+
+    config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
+    torch.random.manual_seed(config.seed + RANK)
+
+    # Training DataLoader
+    train_loader, train_metadata = create_dataloader(
+        config, "train", RANK, WORLD_SIZE,
+        epochs_per_iter=1,
+        global_batch_size=config.global_batch_size,
+        test_set_mode=False
+    )
+    
+    # Eval DataLoader
+    try:
+        eval_loader, eval_metadata = create_dataloader(
+            config,
+            "test",
+            rank=RANK, 
+            world_size=WORLD_SIZE,
+            test_set_mode=True,
+            epochs_per_iter=1,
+            global_batch_size=config.eval_batch_size,
+        )
+    except Exception as e:
+        print(f"NO EVAL DATA FOUND: {e}")
+        eval_loader = eval_metadata = None
+
+    train_state = TrainState(
+        model=None, optimizers=[], optimizer_lrs=[], model_state=None,
+        training_step=0, total_steps=config.training_steps
+    )
+
+    model, optimizers, optimizer_lrs = create_model(config, train_metadata)
+    train_state.model = model
+    train_state.optimizers = optimizers
+    train_state.optimizer_lrs = optimizer_lrs
+
+    if RANK == 0:
+        wandb.init(project=config.project_name,
+                   name=config.run_name, config=config.model_dump())
+        save_code_and_config(config)
+
+    iter_count = 0
+    progress_bar = tqdm.tqdm(
+        total=config.training_steps) if RANK == 0 else None
+
+    # Initial Eval
+    # if eval_loader is not None:
+    #      eval_log_and_checkpoint(
+    #         RANK, WORLD_SIZE, config, train_state, eval_loader, eval_metadata, 
+    #         checkpoint=False, use_subset_of_data=True
+    #     )
+
+    while train_state.training_step < config.training_steps:
+        iter_count += 1
+        if RANK == 0:
+            progress_bar.set_description(f"Iter {iter_count}")
+
+        train_state.model.train()
+
+        for set_name, batch, global_batch_size in train_loader:
+            metrics = train_batch_rloo(config, train_state, batch)
+
+            if RANK == 0:
+                wandb.log(metrics, step=train_state.training_step)
+                progress_bar.set_postfix(
+                    loss=f"{metrics['loss']:.4f}", reward=f"{metrics['reward']:.4f}")
+                progress_bar.update(1)
+
+            # Periodic Evaluation
+            if config.eval_interval > 0 and train_state.training_step % config.eval_interval == 1 and eval_loader is not None:
+                eval_log_and_checkpoint(
+                    RANK, 
+                    WORLD_SIZE, 
+                    config, 
+                    train_state, 
+                    eval_loader, 
+                    eval_metadata, 
+                    checkpoint=config.checkpoint_every_eval,
+                    use_subset_of_data=True
+                )
+
+            if train_state.training_step >= config.training_steps:
+                break
+
+        if RANK == 0:
+            save_train_state(config, train_state)
+            
+    # Final Full Evaluation
+    if eval_loader is not None:
+        print("FINAL EVALUATION WITH FULL TEST DATASET")
+        eval_log_and_checkpoint(
+            RANK, 
+            WORLD_SIZE, 
+            config, 
+            train_state, 
+            eval_loader, 
+            eval_metadata, 
+            checkpoint=True,
+            use_subset_of_data=False
+        )
+
+    if RANK == 0:
+        print("Training Complete.")
+    wandb.finish()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    launch()
+```
+

@@ -108,7 +108,7 @@ class TrainState:
 
 
 def create_dataloader(
-    config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs
+    config, split: str, rank: int, world_size: int, **kwargs
 ):
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
@@ -299,7 +299,6 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
-        # print(f"Loading checkpoint {config.load_checkpoint}")
 
         # Load state dict
         state_dict = torch.load(config.load_checkpoint, map_location="cuda")
@@ -322,7 +321,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         model.load_state_dict(state_dict, assign=True)
 
 
-def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+def compute_lr(base_lr: float, config, train_state: TrainState):
     return cosine_schedule_with_warmup_lr_lambda(
         current_step=train_state.training_step,
         base_lr=base_lr,

@@ -10,4 +10,4 @@
 set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate trp
-python pretrain.py --config-name=cfg_sudoku_mlp
+python pretrain.py --config-name=cfg_sudoku_mlp_gtrm

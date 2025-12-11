@@ -15,15 +15,15 @@ data_paths_test: []
 evaluators: []
 
 # Hyperparams - Training
-global_batch_size: 768
+global_batch_size: 1536 # 768
 
-epochs: 50000 # 50000
+epochs: 75000 # 50000
 # eval is every eval_interval * (train dataset size) / global_batch_size batches
-eval_interval: 5000 # 5000
+eval_interval: 2500 # 5000
 checkpoint_every_eval: True # True
 
 eval_dataset_fraction: 0.1
-eval_max_batches: 25
+eval_max_batches: 18
 
 lr: 1e-4
 lr_min_ratio: 1.0

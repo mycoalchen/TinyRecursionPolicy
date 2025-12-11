@@ -236,7 +236,7 @@ class GTRM_Inner(nn.Module):
         """
 
         # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        embedding = self.embed_tokens(input.to(torch.int32)) # (B,)
 
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:

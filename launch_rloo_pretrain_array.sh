@@ -24,14 +24,14 @@ echo ""
 #
 # Note: Task indices are 1-indexed (SLURM_ARRAY_TASK_ID), but array is 0-indexed
 #       So checkpoint_list[0] goes to task 1, checkpoint_list[1] goes to task 2, etc.
-checkpoint_list=("")
+checkpoint_list=("checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540" "checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540" "checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540" "checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540" "checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540" "checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540" "checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540" "checkpoints/Tiny Recursion Policy/sn_NTE_cont/step_32540")
 
 # ============================================================================
 
 # Make sure the SLURM script is executable
-chmod +x pretrain_array.sh
+chmod +x rloo_pretrain_array.sh
 
-# Write checkpoint list to a file that pretrain_array.sh will source
+# Write checkpoint list to a file that rloo_pretrain_array.sh will source
 checkpoint_file=".checkpoint_list.sh"
 cat > "$checkpoint_file" << EOF
 # Auto-generated checkpoint list (do not edit manually)
@@ -49,7 +49,7 @@ conda activate trp
 
 # Submit the array job
 echo "Submitting SLURM array job..."
-job_id=$(sbatch pretrain_array.sh | awk '{print $4}')
+job_id=$(sbatch rloo_pretrain_array.sh | awk '{print $4}')
 echo "Note: Checkpoint file $checkpoint_file will be used by the array jobs."
 echo "      You can remove it after all jobs complete if desired."
 
@@ -68,9 +68,5 @@ echo ""
 echo "To check job status:"
 echo "  sacct -j $job_id --format=JobID,JobName,State,ExitCode,Start,End"
 echo ""
-echo "Log files will be written to:"
-echo "  out/${job_id}/gtrmarr_${job_id}_*.out"
-echo "  out/${job_id}/gtrmarr_${job_id}_*.err"
-echo ""
 echo "To view real-time output of a specific task (e.g., task 1):"
-echo "  tail -f out/${job_id}/gtrmarr_${job_id}_1.out"
+echo "  tail -f out/${job_id}/rlooarr_${job_id}_1.out"
