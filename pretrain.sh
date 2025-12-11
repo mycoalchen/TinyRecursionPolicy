@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=gtrm
-#SBATCH --output=out/%x-%j.log            # Stdout log file (%x=job name, %j=job ID)
-#SBATCH --error=out/%x-%j.err
+#SBATCH --job-name=trm-time_emb
+#SBATCH --output=out/%x-y-%j.log            # Stdout log file (%x=job name, %j=job ID)
+#SBATCH --error=out/%x-y-%j.err
 #SBATCH --partition=general
 #SBATCH --nodes=1
 #SBATCH --time=40:00:00

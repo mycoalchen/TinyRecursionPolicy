@@ -28,6 +28,7 @@ from utils.functions import (
 )
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
+from models.recursive_reasoning.gtrm import GTRMState
 
 
 class LossConfig(pydantic.BaseModel):
@@ -100,14 +101,14 @@ class TrainState:
     model: nn.Module
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
-    carry: Any
+    model_state: Any
 
-    step: int
+    training_step: int
     total_steps: int
 
 
 def create_dataloader(
-    config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs
+    config, split: str, rank: int, world_size: int, **kwargs
 ):
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
@@ -155,8 +156,9 @@ def create_model(
 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
-        print(model)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        # print(model)
+        model = loss_head_cls(model, config.arch.loss.loss_type, config.arch.loss.act_loss_weight)  # type: ignore
+        # print(f"ACT loss weight {config.arch.loss.act_loss_weight}")
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
@@ -274,12 +276,12 @@ def init_train_state(
     )
 
     return TrainState(
-        step=0,
+        training_step=0,
         total_steps=total_steps,
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None,
+        model_state=None,
     )
 
 
@@ -291,13 +293,12 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     os.makedirs(config.checkpoint_path, exist_ok=True)
     torch.save(
         train_state.model.state_dict(),
-        os.path.join(config.checkpoint_path, f"step_{train_state.step}"),
+        os.path.join(config.checkpoint_path, f"step_{train_state.training_step}"),
     )
 
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
-        print(f"Loading checkpoint {config.load_checkpoint}")
 
         # Load state dict
         state_dict = torch.load(config.load_checkpoint, map_location="cuda")
@@ -320,9 +321,9 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         model.load_state_dict(state_dict, assign=True)
 
 
-def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+def compute_lr(base_lr: float, config, train_state: TrainState):
     return cosine_schedule_with_warmup_lr_lambda(
-        current_step=train_state.step,
+        current_step=train_state.training_step,
         base_lr=base_lr,
         num_warmup_steps=round(config.lr_warmup_steps),
         num_training_steps=train_state.total_steps,
@@ -358,21 +359,18 @@ def train_batch(
     rank: int,
     world_size: int,
 ):
-    train_state.step += 1
-    if train_state.step > train_state.total_steps:  # At most train_total_steps
+    train_state.training_step += 1
+    if train_state.training_step > train_state.total_steps:  # At most train_total_steps
         return
 
-    # To device
     batch = {k: v.cuda() for k, v in batch.items()}
 
-    # Init carry if it is None
-    if train_state.carry is None:
+    if train_state.model_state is None:
         with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+            train_state.model_state = train_state.model.model.initial_state_train(batch)  # type: ignore
 
-    # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(
-        carry=train_state.carry, batch=batch, return_keys=[]
+    train_state.model_state, loss, metrics, _, _ = train_state.model(
+        state=train_state.model_state, batch=batch, return_keys=[]
     )
 
     ((1 / global_batch_size) * loss).backward()
@@ -452,20 +450,16 @@ def evaluate(
         data_subset_batch_indices = None
 
     with torch.inference_mode():
-        return_keys = set(config.eval_save_outputs)
-        for evaluator in evaluators:
-            evaluator.begin_eval()
-            return_keys.update(evaluator.required_outputs)
+        return_keys = set(config.eval_save_outputs) # Empty
+        return_keys.add("logits")
+        return_keys.add("q_halt_logits")
 
-        # Run evaluation
-        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
+        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)} # 'all': 0
 
-        save_preds = {}
-
+        save_outputs = {}
         metric_keys = []
         metric_values = None
 
-        carry = None
         processed_batches = 0
 
         for batch_idx, (set_name, batch, global_batch_size) in enumerate(eval_loader):
@@ -479,37 +473,29 @@ def evaluate(
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
 
-            # To device
+            # inputs: (B, seq_len), labels: (B, seq_len), puzzle_identifiers: (B)
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
-                carry = train_state.model.initial_carry(batch)  # type: ignore
-
+                state = train_state.model.model.initial_state_eval(batch)
+            
             # Forward
-            inference_steps = 0
-            while True:
-                carry, loss, metrics, preds, all_finish = train_state.model(
-                    carry=carry, batch=batch, return_keys=return_keys
+            outputs = None
+            for inference_step in range(config.arch.halt_max_steps):
+                state, loss, metrics, outputs, all_finish = train_state.model(
+                    state=state, batch=batch, prev_outputs=outputs, return_keys=return_keys
                 )
-                inference_steps += 1
-
                 if all_finish:
-                    break
+                    if rank == 0:
+                        print(f"  Completed inference in {inference_step + 1} steps")
+                        break
 
-            if rank == 0:
-                print(f"  Completed inference in {inference_steps} steps")
-
-            for collection in (batch, preds):
+            for collection in (batch, outputs):
                 for k, v in collection.items():
                     if k in config.eval_save_outputs:
-                        save_preds.setdefault(k, [])
-                        save_preds[k].append(
-                            v.cpu()
-                        )  # Move to CPU for saving GPU memory
+                        save_outputs.setdefault(k, [])
+                        save_outputs[k].append(v.cpu())  # Move to CPU for saving GPU memory
 
-            for evaluator in evaluators:
-                evaluator.update_batch(batch, preds)
-
-            del carry, loss, preds, batch, all_finish
+            del state, loss, outputs, batch, all_finish
 
             # Aggregate metrics
             set_id = set_ids[set_name]
@@ -529,20 +515,20 @@ def evaluate(
             del metrics
 
         # concatenate save preds
-        save_preds = {k: torch.cat(v, dim=0) for k, v in save_preds.items()}
+        save_outputs = {k: torch.cat(v, dim=0) for k, v in save_outputs.items()}
 
         # Save preds
-        if config.checkpoint_path is not None and len(save_preds):
+        if config.checkpoint_path is not None and len(save_outputs):
             # Each rank save predictions independently
             os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
             torch.save(
-                save_preds,
+                save_outputs,
                 os.path.join(
-                    config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}"
+                    config.checkpoint_path, f"step_{train_state.training_step}_all_preds.{rank}"
                 ),
             )
 
-        del save_preds
+        del save_outputs
 
         # Reduce to rank 0
         if metric_values is not None:
@@ -561,43 +547,8 @@ def evaluate(
 
                 # Postprocess
                 for set_name, m in reduced_metrics.items():
-                    count = m.pop("count")
+                    count = max(m.pop("count"), 1)  # Avoid NaNs
                     reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
-
-        # Run evaluators
-        if rank == 0:
-            print(f"\nRunning {len(evaluators)} evaluator(s)...")
-
-        for i, evaluator in enumerate(evaluators):
-            if rank == 0:
-                print(
-                    f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}"
-                )
-
-            # Path for saving
-            evaluator_save_path = None
-            if config.checkpoint_path is not None:
-                evaluator_save_path = os.path.join(
-                    config.checkpoint_path,
-                    f"evaluator_{evaluator.__class__.__name__}_step_{train_state.step}",
-                )
-                os.makedirs(evaluator_save_path, exist_ok=True)
-
-            # Run and log
-            metrics = evaluator.result(
-                evaluator_save_path, rank=rank, world_size=world_size, group=cpu_group
-            )
-            if rank == 0 and metrics is not None:
-                if reduced_metrics is None:
-                    reduced_metrics = {}
-
-                reduced_metrics.update(metrics)
-                print(f"  Completed {evaluator.__class__.__name__}")
-
-        if rank == 0:
-            print(
-                f"All evaluators completed! Elapsed time {(datetime.datetime.now() - eval_start_time).seconds}s"
-            )
 
     return reduced_metrics
 
@@ -638,7 +589,7 @@ def eval_log_and_checkpoint(
     )
 
     if RANK == 0 and metrics is not None:
-        wandb.log(metrics, step=train_state.step)
+        wandb.log(metrics, step=train_state.training_step)
 
     if checkpoint and RANK == 0:
         print("SAVE CHECKPOINT")
@@ -812,8 +763,8 @@ def launch(hydra_config: DictConfig):
             )
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                wandb.log(metrics, step=train_state.training_step)
+                progress_bar.update(train_state.training_step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
 

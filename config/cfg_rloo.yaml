@@ -1,0 +1,47 @@
+defaults:
+  - arch: gtrm
+  - _self_
+
+hydra:
+  output_subdir: null
+
+data_paths: ['data/sudoku-extreme-1k-aug-1000']
+data_paths_test: []
+
+global_batch_size: 256
+num_rollouts_per_input: 4
+training_steps: 2000
+
+eval_batch_size: 1536
+eval_interval: 200
+eval_max_batches: 20 # 25
+eval_dataset_fraction: 0.05
+checkpoint_every_eval: True
+
+lr: 1e-5
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+
+beta1: 0.9
+beta2: 0.95
+weight_decay: 1.0
+puzzle_emb_weight_decay: 1.0
+
+puzzle_emb_lr: 1e-4
+
+seed: 0
+
+use_kl: False # False
+
+project_name: 'rloo'
+run_name: rloo
+
+# load_checkpoint: 'checkpoints/Tiny Recursion Policy/sw_NTE_cont/step_32540'
+# checkpoint_path: 'checkpoints/Tiny Recursion Policy/RL_sw_NTE'
+
+rloo:
+  epsilon: 0.2
+  reward_type: cell_match  # "validation" or "cell_match"
+  entropy_coef: 0.01
+
+forward_dtype: float32
