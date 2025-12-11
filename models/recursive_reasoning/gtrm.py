@@ -220,8 +220,17 @@ class GTRM_Inner(nn.Module):
             self.H_level = GTRMReasoningModule(config=self.config, layers=[GTRMBlock(self.config) for _i in range(self.config.L_layers)], gaussian=False)
 
         # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        
+        # Always init L (Worker / Main State)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        
+        # Conditionally init H (Manager State)
+        if self.config.num_latents == 2:
+            self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        else:
+            # Placeholder to satisfy load_state_dict if architectures switch, 
+            # though usually strictly separated by config.
+            self.register_buffer("H_init", None)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
